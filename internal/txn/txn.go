@@ -310,6 +310,9 @@ func (t *Txn) Visible(h storage.TupleHeader) bool {
 	if t.Snap == nil {
 		t.Snapshot()
 	}
+	if h.Flags&storage.FlagKilled != 0 {
+		return false
+	}
 	if h.Xmin == t.Xid && t.Xid != 0 {
 		if h.Cmin >= t.Cid {
 			return false // inserted by this or a later command

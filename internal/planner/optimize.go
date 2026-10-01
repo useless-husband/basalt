@@ -932,3 +932,6 @@ func (o *Optimizer) PlanDelete(del *Delete) (Plan, error) {
 	p.E = Est{Startup: se.Total, Total: se.Total + se.Rows*cpuTupleCost*10}
 	return p, nil
 }
+
+// UsedColumns returns the columns referenced anywhere in a plan subtree.
+func UsedColumns(p Plan) map[expr.ColumnID]bool { return usedColumns(p) }

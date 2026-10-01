@@ -53,6 +53,9 @@ const (
 	FlagLockOnly uint16 = 1
 	// FlagUpdated marks a tuple whose deleter replaced it with a new version.
 	FlagUpdated uint16 = 2
+	// FlagKilled marks a tuple its own inserter withdrew (a speculative
+	// insert that hit ON CONFLICT DO NOTHING); it is invisible to everyone.
+	FlagKilled uint16 = 4
 )
 
 // TupleHeader is the decoded MVCC header of a tuple.
