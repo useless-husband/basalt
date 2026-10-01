@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 
 	"github.com/useless-husband/basalt/internal/pgerr"
@@ -294,9 +295,14 @@ func (t *BTree) descend(key []byte) ([]PageID, []int, error) {
 	}
 }
 
+// ErrRemoveKey may be returned by an Insert check callback: the existing
+// key points at a row version no snapshot can see, and is deleted.
+var ErrRemoveKey = errors.New("remove this index entry")
+
 // Insert adds a key. check, if not nil, is called first for every existing
 // key that starts with key[:prefixLen] (used for unique constraints); if it
-// returns an error nothing is inserted.
+// returns an error nothing is inserted, except for ErrRemoveKey, which
+// deletes that existing key and carries on.
 func (t *BTree) Insert(key []byte, prefixLen int, check func(existing []byte) error) error {
 	if len(key) > MaxKeySize {
 		return errKeyTooLarge(len(key))
@@ -305,8 +311,23 @@ func (t *BTree) Insert(key []byte, prefixLen int, check func(existing []byte) er
 	defer t.mu.Unlock()
 	if check != nil {
 		prefix := key[:prefixLen]
-		if err := t.scanPrefixLocked(prefix, check); err != nil {
+		var dead [][]byte
+		err := t.scanPrefixLocked(prefix, func(k []byte) error {
+			if err := check(k); err != nil {
+				if err != ErrRemoveKey {
+					return err
+				}
+				dead = append(dead, k)
+			}
+			return nil
+		})
+		if err != nil {
 			return err
+		}
+		for _, k := range dead {
+			if _, err := t.deleteLocked(k); err != nil {
+				return err
+			}
 		}
 	}
 	path, idx, err := t.descend(key)
@@ -460,6 +481,10 @@ func (t *BTree) insertLevel(m *Mtr, path []PageID, idx []int, level int, key []b
 func (t *BTree) Delete(key []byte) (bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.deleteLocked(key)
+}
+
+func (t *BTree) deleteLocked(key []byte) (bool, error) {
 	path, idx, err := t.descend(key)
 	if err != nil {
 		return false, err

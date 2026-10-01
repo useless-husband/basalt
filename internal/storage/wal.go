@@ -34,6 +34,7 @@ type WAL struct {
 
 	mu       sync.Mutex
 	buf      []byte
+	spare    []byte // the other buffer of the pair (guarded by flushMu)
 	bufStart LSN
 	err      error // sticky write error
 
@@ -42,7 +43,8 @@ type WAL struct {
 	segStart LSN
 	flushed  atomic.Uint64
 
-	Syncs atomic.Uint64 // number of syncs, for statistics
+	Syncs   atomic.Uint64 // number of syncs, for statistics
+	Written atomic.Uint64 // bytes written
 }
 
 func segName(start LSN) string { return fmt.Sprintf("%016x.wal", uint64(start)) }
@@ -176,15 +178,19 @@ func (w *WAL) Flush(upto LSN) error {
 	}
 	data := w.buf
 	start := w.bufStart
-	w.buf = make([]byte, 0, max(cap(data), 64<<10))
+	// Swap in the spare buffer; the one being written becomes the spare
+	// (only one flush runs at a time, under flushMu).
+	w.buf, w.spare = w.spare[:0], nil
 	w.bufStart += LSN(len(data))
 	end := w.bufStart
 	w.mu.Unlock()
+	defer func() { w.spare = data[:0] }()
 
 	if len(data) > 0 {
 		if _, err := w.file.WriteAt(data, int64(start-w.segStart)); err != nil {
 			return w.fail(err)
 		}
+		w.Written.Add(uint64(len(data)))
 	}
 	if err := w.file.Sync(); err != nil {
 		return w.fail(err)

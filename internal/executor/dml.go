@@ -97,6 +97,34 @@ func (o *tableOps) validate(vals Row) error {
 	return nil
 }
 
+func sameKey(ix *catalog.Index, a, b Row) bool {
+	for _, c := range ix.Columns {
+		if !types.Equal(a[c], b[c]) || a[c].K != b[c].K {
+			return false
+		}
+	}
+	return true
+}
+
+// deadToAll reports whether no snapshot, current or future, can see the
+// tuple version (the condition under which VACUUM removes it).
+func (c *Ctx) deadToAll(h storage.TupleHeader) bool {
+	if h.Flags&storage.FlagKilled != 0 {
+		return true
+	}
+	m := c.Txn.Manager()
+	if m.Status(h.Xmin) == txn.Aborted {
+		return true
+	}
+	if h.Xmax == 0 || h.Flags&storage.FlagLockOnly != 0 || m.Status(h.Xmax) != txn.Committed {
+		return false
+	}
+	if c.horizon == 0 {
+		c.horizon = m.OldestXmin()
+	}
+	return h.Xmax < c.horizon
+}
+
 // liveDirty classifies a tuple by the latest committed state (not by the
 // snapshot): live, dead, or "wait for this transaction to finish".
 func (c *Ctx) liveDirty(h storage.TupleHeader) (bool, uint64) {
@@ -132,6 +160,14 @@ func (c *Ctx) liveDirty(h storage.TupleHeader) (bool, uint64) {
 // onConflict set, a unique violation returns the TID of the conflicting
 // live row instead of an error (and the new tuple is withdrawn).
 func (o *tableOps) insertTuple(vals Row, onConflict bool) (storage.TID, storage.TID, bool, error) {
+	return o.insertVersion(vals, nil, onConflict)
+}
+
+// insertVersion is insertTuple for an UPDATE's new version: old holds the
+// previous version's values, and unique indexes whose key did not change
+// skip the uniqueness check (the locked old version already owns the key,
+// so no other live version can hold it).
+func (o *tableOps) insertVersion(vals, old Row, onConflict bool) (storage.TID, storage.TID, bool, error) {
 	xid, err := o.c.Txn.AssignXid()
 	if err != nil {
 		return 0, 0, false, err
@@ -143,7 +179,13 @@ func (o *tableOps) insertTuple(vals Row, onConflict bool) (storage.TID, storage.
 	}
 	o.c.touched = append(o.c.touched, touch{heap: o.heap, tid: tid})
 	for _, ix := range o.indexes {
-		conflict, err := o.insertIndex(ix, vals, tid)
+		var conflict storage.TID
+		var err error
+		if old != nil && ix.Unique && sameKey(ix, old, vals) {
+			err = o.c.Store.BTree(ix.Root).Insert(indexKey(ix, vals, tid), 0, nil)
+		} else {
+			conflict, err = o.insertIndex(ix, vals, tid)
+		}
 		if err != nil {
 			if errors.Is(err, errDup) {
 				if onConflict {
@@ -198,7 +240,8 @@ func (o *tableOps) insertIndex(ix *catalog.Index, vals Row, tid storage.TID) (st
 				return nil
 			}
 			buf = tuple
-			live, w := o.c.liveDirty(storage.DecodeHeader(tuple))
+			h := storage.DecodeHeader(tuple)
+			live, w := o.c.liveDirty(h)
 			if w != 0 {
 				wait = w
 				return errWait
@@ -206,6 +249,9 @@ func (o *tableOps) insertIndex(ix *catalog.Index, vals Row, tid storage.TID) (st
 			if live {
 				conflict = etid
 				return errDup
+			}
+			if o.c.deadToAll(h) {
+				return storage.ErrRemoveKey
 			}
 			return nil
 		})
@@ -649,7 +695,7 @@ func (o *tableOps) updateRow(tid storage.TID, old, newVals Row, depth int) (bool
 	if err := o.checkIncomingFKs(old, newVals, depth); err != nil {
 		return false, err
 	}
-	if _, _, _, err := o.insertTuple(newVals, false); err != nil {
+	if _, _, _, err := o.insertVersion(newVals, old, false); err != nil {
 		return false, err
 	}
 	if o.c.TableChanged != nil {

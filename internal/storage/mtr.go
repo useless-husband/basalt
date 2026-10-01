@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/useless-husband/basalt/internal/pgerr"
 )
@@ -28,6 +29,15 @@ type mtrPage struct {
 	f      *Frame
 	before []byte
 	isNew  bool
+}
+
+// pagePool recycles the before-image buffers of mini-transactions.
+var pagePool = sync.Pool{New: func() any { b := make([]byte, PageSize); return &b }}
+
+func pageCopy(src []byte) []byte {
+	b := *(pagePool.Get().(*[]byte))
+	copy(b, src)
+	return b
 }
 
 // Begin starts a mini-transaction.
@@ -55,7 +65,7 @@ func (m *Mtr) Page(id PageID) ([]byte, error) {
 		return nil, err
 	}
 	f.Latch.Lock()
-	m.pages = append(m.pages, &mtrPage{f: f, before: append([]byte(nil), f.Data...)})
+	m.pages = append(m.pages, &mtrPage{f: f, before: pageCopy(f.Data)})
 	return f.Data, nil
 }
 
@@ -71,7 +81,7 @@ func (m *Mtr) fresh(id PageID) ([]byte, error) {
 		return nil, err
 	}
 	f.Latch.Lock()
-	before := append([]byte(nil), f.Data...)
+	before := pageCopy(f.Data)
 	clear(f.Data)
 	m.pages = append(m.pages, &mtrPage{f: f, before: before, isNew: true})
 	return f.Data, nil
@@ -81,6 +91,9 @@ func (m *Mtr) release() {
 	for _, p := range m.pages {
 		p.f.Latch.Unlock()
 		m.s.pool.unpin(p.f)
+		b := p.before
+		p.before = nil
+		pagePool.Put(&b)
 	}
 	m.pages = nil
 	if !m.done {

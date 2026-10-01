@@ -44,7 +44,14 @@ func main() {
 	clientList := flag.String("clients", "1,4,8,16", "client counts to run")
 	duration := flag.Duration("duration", 20*time.Second, "duration of each run")
 	noSync := flag.Bool("no-fsync", false, "start basalt with -unsafe-no-fsync (measures CPU cost without durability)")
+	embedded := flag.Bool("embedded", false, "run basalt in-process (no network, no fsync) to measure engine CPU cost")
+	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile (embedded mode)")
+	memprofile := flag.String("memprofile", "", "write an allocation profile (embedded mode)")
 	flag.Parse()
+	if *embedded {
+		runEmbedded(*scale, *clientList, *duration, *cpuprofile, *memprofile)
+		return
+	}
 
 	ctx := context.Background()
 	if *url == "" {

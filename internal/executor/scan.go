@@ -237,6 +237,14 @@ func (s *indexScan) Next() (Row, error) {
 		if keep {
 			return r, nil
 		}
+		// An entry for a version no snapshot can see is deleted from the
+		// index on the spot, so hot rows do not drag long version chains
+		// through every lookup until VACUUM runs.
+		if s.c.deadToAll(storage.DecodeHeader(tuple)) {
+			if _, err := s.tree.Delete(k); err != nil {
+				return nil, err
+			}
+		}
 	}
 }
 

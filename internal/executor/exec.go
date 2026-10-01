@@ -43,6 +43,8 @@ type Ctx struct {
 	// touched records the tuple changes of the statement so that a READ
 	// COMMITTED statement can be undone and restarted.
 	touched []touch
+	// horizon caches OldestXmin for deadToAll during one statement.
+	horizon uint64
 }
 
 type touch struct {
