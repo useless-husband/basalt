@@ -235,13 +235,17 @@ func (c *Ctx) build(p planner.Plan) (Iter, error) {
 
 // instrumented counts rows and time for EXPLAIN ANALYZE.
 type instrumented struct {
-	in Iter
-	st *planner.NodeStats
+	in      Iter
+	st      *planner.NodeStats
+	started bool
+	base    time.Duration // st.Time when the current loop started
 }
 
 func (i *instrumented) Open(ec *expr.Ctx) error {
 	start := time.Now()
 	i.st.Loops++
+	i.started = false
+	i.base = i.st.Time
 	err := i.in.Open(ec)
 	i.st.Time += time.Since(start)
 	return err
@@ -251,6 +255,10 @@ func (i *instrumented) Next() (Row, error) {
 	start := time.Now()
 	r, err := i.in.Next()
 	i.st.Time += time.Since(start)
+	if !i.started {
+		i.started = true
+		i.st.First += i.st.Time - i.base
+	}
 	if r != nil {
 		i.st.Rows++
 	}

@@ -23,6 +23,8 @@ type NodeStats struct {
 	Rows  int64
 	Loops int64
 	Time  time.Duration
+	// First is the time to the first row, summed over loops.
+	First time.Duration
 	// Extra lines such as "Rows Removed by Filter".
 	Removed int64
 }
@@ -332,9 +334,11 @@ func Explain(p Plan, opt ExplainOptions) []string {
 			if b.Stats.Loops == 0 {
 				head += " (never executed)"
 			} else {
-				rows := float64(b.Stats.Rows) / float64(b.Stats.Loops)
-				ms := float64(b.Stats.Time.Microseconds()) / 1000 / float64(b.Stats.Loops)
-				head += fmt.Sprintf(" (actual time=%.3f rows=%.0f loops=%d)", ms, rows, b.Stats.Loops)
+				loops := float64(b.Stats.Loops)
+				rows := float64(b.Stats.Rows) / loops
+				first := float64(b.Stats.First.Microseconds()) / 1000 / loops
+				total := float64(b.Stats.Time.Microseconds()) / 1000 / loops
+				head += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.0f loops=%d)", first, total, rows, b.Stats.Loops)
 			}
 		}
 		lines = append(lines, head)
@@ -503,8 +507,20 @@ func nodeDetails(p Plan, opt ExplainOptions) []string {
 		if x.IndexCond != nil {
 			out = append(out, "Index Cond: "+cond(x.IndexCond))
 		}
-		if x.Filter != nil {
-			out = append(out, "Filter: "+cond(x.Filter))
+		// The executor rechecks every predicate; show only those the index
+		// bounds do not already implement.
+		done := map[string]bool{}
+		for _, c := range expr.Conjuncts(x.IndexCond) {
+			done[c.String()] = true
+		}
+		var rest []expr.Expr
+		for _, c := range expr.Conjuncts(x.Filter) {
+			if !done[c.String()] {
+				rest = append(rest, c)
+			}
+		}
+		if len(rest) > 0 {
+			out = append(out, "Filter: "+cond(expr.MakeAnd(rest)))
 		}
 	case *VScanP:
 		if x.Filter != nil {
