@@ -424,7 +424,6 @@ func sortRows(rows [][]types.Value, col int) {
 // Constraint oids are derived from the owning object so they are stable.
 func checkOid(table uint32, i int) uint32   { return 0x40000000 | table<<8 | uint32(i) }
 func fkOid(table uint32, i int) uint32      { return 0x50000000 | table<<8 | uint32(i) }
-func notNullOid(table uint32, i int) uint32 { return 0x60000000 | table<<8 | uint32(i) }
 func attrdefOid(table uint32, i int) uint32 { return 0x70000000 | table<<8 | uint32(i) }
 
 func int2s(cols []int) types.Value {

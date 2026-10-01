@@ -512,11 +512,6 @@ func flattenInner(n Node, leaves *[]Node, preds *[]expr.Expr) {
 	*leaves = append(*leaves, n)
 }
 
-type cand struct {
-	plan Plan
-	rows float64
-}
-
 func (o *Optimizer) planJoinRegion(j *Join) (Plan, error) {
 	var leaves []Node
 	var preds []expr.Expr

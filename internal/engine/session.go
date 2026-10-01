@@ -359,26 +359,6 @@ func isDDL(st sql.Stmt) bool {
 	return false
 }
 
-func stmtName(st sql.Stmt) string {
-	switch x := st.(type) {
-	case *sql.CreateTableStmt:
-		return "CREATE TABLE"
-	case *sql.CreateIndexStmt:
-		return "CREATE INDEX"
-	case *sql.DropStmt:
-		return [...]string{"DROP TABLE", "DROP INDEX", "DROP SEQUENCE", "DROP VIEW"}[x.Kind]
-	case *sql.AlterTableStmt:
-		return "ALTER TABLE"
-	case *sql.TruncateStmt:
-		return "TRUNCATE TABLE"
-	case *sql.CreateSequenceStmt:
-		return "CREATE SEQUENCE"
-	case *sql.VacuumStmt:
-		return "VACUUM"
-	}
-	return "this statement"
-}
-
 // run executes one statement. params are bound parameter values; prep is
 // the prepared statement when run through the extended protocol.
 func (s *Session) run(st sql.Stmt, params []types.Value, prep *Prepared, inBatch bool) (*Result, error) {
@@ -916,8 +896,5 @@ func (s *Session) TxnID() int64 {
 	}
 	return int64(x)
 }
-
-// SettingEnv implements expr.Env's Setting.
-func (s *Session) settingEnv(name string) (string, bool) { return s.Setting(name) }
 
 var _ = catalog.QuoteIdent

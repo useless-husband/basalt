@@ -296,7 +296,6 @@ type values struct {
 	rows [][]expr.Fn
 	i    int
 	ec   *expr.Ctx
-	out  Row
 }
 
 func (c *Ctx) newValues(p *planner.ValuesP) (Iter, error) {

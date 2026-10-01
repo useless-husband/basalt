@@ -2,7 +2,6 @@ package storage
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"sync"
@@ -491,8 +490,6 @@ func (c *control) write(redo LSN) error {
 
 // IsClosed reports whether Close or Abandon was called.
 func (s *Store) IsClosed() bool { return s.closed.Load() }
-
-var errNoSpace = errors.New("no space on page")
 
 // CatalogRoot reads the catalog pointer through the mini-transaction (the
 // meta page may already be latched by it).

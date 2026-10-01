@@ -110,8 +110,7 @@ func TestBTreeRandomInsertDelete(t *testing.T) {
 			delete(present, i)
 		} else if !present[i] {
 			// Large padding makes splits frequent.
-			k := append(btKeyOf(i), bytes.Repeat([]byte{byte(i)}, r.Intn(300))...)
-			k = btKeyOf(i)
+			k := btKeyOf(i)
 			if err := tr.Insert(k, 0, nil); err != nil {
 				t.Fatalf("seed %d: insert %d: %v", seed, i, err)
 			}

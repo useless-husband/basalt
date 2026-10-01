@@ -279,14 +279,6 @@ func indexKey(ix *catalog.Index, vals Row, tid storage.TID) []byte {
 	return appendTID(k, tid)
 }
 
-func indexPrefix(ix *catalog.Index, vals Row) []byte {
-	var k []byte
-	for _, c := range ix.Columns {
-		k = types.EncodeKey(k, vals[c])
-	}
-	return k
-}
-
 func appendTID(k []byte, tid storage.TID) []byte {
 	v := uint64(tid)
 	return append(k, byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8), byte(v))

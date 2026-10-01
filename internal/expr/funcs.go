@@ -115,18 +115,6 @@ func numericOrFloat(extra ...types.T) func([]types.T) (types.T, []types.T, error
 	}
 }
 
-func sameType(args []types.T) (types.T, []types.T, error) {
-	t := args[0]
-	if t.Oid == types.OidUnknown {
-		t = types.Text
-	}
-	casts := make([]types.T, len(args))
-	for i := range casts {
-		casts[i] = t
-	}
-	return t, casts, nil
-}
-
 func textArgs(ret types.T) func([]types.T) (types.T, []types.T, error) {
 	return func(args []types.T) (types.T, []types.T, error) {
 		casts := make([]types.T, len(args))

@@ -211,20 +211,5 @@ func (p *Pool) flushAll() error {
 	return firstErr
 }
 
-// discard drops a page from the pool without writing it (the page was
-// freed and its content no longer matters). The page must be unpinned
-// apart from the caller's own pin.
-func (p *Pool) dirtyCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	n := 0
-	for _, f := range p.table {
-		if f.dirty.Load() {
-			n++
-		}
-	}
-	return n
-}
-
 // ErrClosed is returned after the store has been closed.
 var ErrClosed = errors.New("storage: store is closed")
