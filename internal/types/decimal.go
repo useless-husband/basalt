@@ -9,13 +9,47 @@ import (
 	"github.com/useless-husband/basalt/internal/pgerr"
 )
 
-// Decimal is an arbitrary precision decimal number: coef * 10^-scale.
-// Scale is the display scale (PostgreSQL's dscale), so 1.50 has coef 150
-// and scale 2. The zero value is 0. Decimals are immutable.
+// Decimal is an arbitrary precision decimal number: coefficient *
+// 10^-scale. Scale is the display scale (PostgreSQL's dscale), so 1.50 has
+// coefficient 150 and scale 2. The zero value is 0. Decimals are
+// immutable.
+//
+// A coefficient that fits in an int64 is kept in small (coef is nil), and
+// the common operations work on it directly; coef holds larger ones.
 type Decimal struct {
 	coef  *big.Int
+	small int64
 	scale int32
 	nan   bool
+}
+
+var pow10i64 = [19]int64{1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18}
+
+// fromBig builds a decimal, keeping the coefficient small when it fits.
+func fromBig(c *big.Int, scale int32) Decimal {
+	if c.IsInt64() {
+		return Decimal{small: c.Int64(), scale: scale}
+	}
+	return Decimal{coef: c, scale: scale}
+}
+
+// rescaled returns the coefficient at scale s >= d.scale if it fits.
+func (d Decimal) rescaled(s int32) (int64, bool) {
+	if d.coef != nil {
+		return 0, false
+	}
+	k := s - d.scale
+	if k == 0 {
+		return d.small, true
+	}
+	if k < 0 || k > 18 {
+		return 0, false
+	}
+	p := pow10i64[k]
+	if d.small > math.MaxInt64/p || d.small < math.MinInt64/p {
+		return 0, false
+	}
+	return d.small * p, true
 }
 
 var (
@@ -45,7 +79,10 @@ var NaNDecimal = Decimal{nan: true}
 
 func (d Decimal) c() *big.Int {
 	if d.coef == nil {
-		return bigZero
+		if d.small == 0 {
+			return bigZero
+		}
+		return big.NewInt(d.small)
 	}
 	return d.coef
 }
@@ -57,14 +94,25 @@ func (d Decimal) IsNaN() bool { return d.nan }
 func (d Decimal) Scale() int32 { return d.scale }
 
 // Sign returns -1, 0 or 1.
-func (d Decimal) Sign() int { return d.c().Sign() }
+func (d Decimal) Sign() int {
+	if d.coef == nil {
+		switch {
+		case d.small > 0:
+			return 1
+		case d.small < 0:
+			return -1
+		}
+		return 0
+	}
+	return d.coef.Sign()
+}
 
 // DecimalFromInt converts an integer.
-func DecimalFromInt(i int64) Decimal { return Decimal{coef: big.NewInt(i)} }
+func DecimalFromInt(i int64) Decimal { return Decimal{small: i} }
 
 // DecimalFromBig builds a decimal from a coefficient and scale.
 func DecimalFromBig(coef *big.Int, scale int32) Decimal {
-	return Decimal{coef: new(big.Int).Set(coef), scale: scale}
+	return fromBig(new(big.Int).Set(coef), scale)
 }
 
 // DecimalFromFloat converts a float using 15 significant digits, like
@@ -118,6 +166,15 @@ func ParseDecimal(s string) (Decimal, error) {
 			return bad()
 		}
 	}
+	if scale := int64(len(frac)) - exp; len(digits) > 0 && len(digits) <= 18 && scale >= 0 && scale <= 16383 {
+		v, err := strconv.ParseInt(digits, 10, 64)
+		if err == nil {
+			if neg {
+				v = -v
+			}
+			return Decimal{small: v, scale: int32(scale)}, nil
+		}
+	}
 	coef, ok := new(big.Int).SetString(digits, 10)
 	if !ok {
 		if digits == "" {
@@ -137,7 +194,7 @@ func ParseDecimal(s string) (Decimal, error) {
 	if neg {
 		coef.Neg(coef)
 	}
-	return Decimal{coef: coef, scale: int32(scale)}, nil
+	return fromBig(coef, int32(scale)), nil
 }
 
 // String formats d with exactly scale digits after the decimal point.
@@ -145,9 +202,19 @@ func (d Decimal) String() string {
 	if d.nan {
 		return "NaN"
 	}
-	c := d.c()
-	neg := c.Sign() < 0
-	s := new(big.Int).Abs(c).String()
+	var s string
+	var neg bool
+	if d.coef == nil && d.small != math.MinInt64 {
+		v := d.small
+		if v < 0 {
+			neg, v = true, -v
+		}
+		s = strconv.FormatInt(v, 10)
+	} else {
+		c := d.c()
+		neg = c.Sign() < 0
+		s = new(big.Int).Abs(c).String()
+	}
 	if d.scale > 0 {
 		if int32(len(s)) <= d.scale {
 			s = strings.Repeat("0", int(d.scale)-len(s)+1) + s
@@ -184,6 +251,11 @@ func (d Decimal) Cmp(e Decimal) int {
 	if e.scale > s {
 		s = e.scale
 	}
+	if a, ok := d.rescaled(s); ok {
+		if b, ok := e.rescaled(s); ok {
+			return cmpInt(a, b)
+		}
+	}
 	return d.rescale(s).Cmp(e.rescale(s))
 }
 
@@ -196,7 +268,14 @@ func (d Decimal) Add(e Decimal) Decimal {
 	if e.scale > s {
 		s = e.scale
 	}
-	return Decimal{coef: new(big.Int).Add(d.rescale(s), e.rescale(s)), scale: s}
+	if a, ok := d.rescaled(s); ok {
+		if b, ok := e.rescaled(s); ok {
+			if r := a + b; (b >= 0) == (r >= a) {
+				return Decimal{small: r, scale: s}
+			}
+		}
+	}
+	return fromBig(new(big.Int).Add(d.rescale(s), e.rescale(s)), s)
 }
 
 // Sub returns d-e.
@@ -208,7 +287,14 @@ func (d Decimal) Sub(e Decimal) Decimal {
 	if e.scale > s {
 		s = e.scale
 	}
-	return Decimal{coef: new(big.Int).Sub(d.rescale(s), e.rescale(s)), scale: s}
+	if a, ok := d.rescaled(s); ok {
+		if b, ok := e.rescaled(s); ok {
+			if r := a - b; (b >= 0) == (r <= a) {
+				return Decimal{small: r, scale: s}
+			}
+		}
+	}
+	return fromBig(new(big.Int).Sub(d.rescale(s), e.rescale(s)), s)
 }
 
 // Mul returns d*e with scale d.scale+e.scale.
@@ -216,7 +302,16 @@ func (d Decimal) Mul(e Decimal) Decimal {
 	if d.nan || e.nan {
 		return NaNDecimal
 	}
-	return Decimal{coef: new(big.Int).Mul(d.c(), e.c()), scale: d.scale + e.scale}
+	if d.coef == nil && e.coef == nil {
+		a, b := d.small, e.small
+		if a == 0 || b == 0 {
+			return Decimal{scale: d.scale + e.scale}
+		}
+		if r := a * b; r/b == a && !(a == -1 && b == math.MinInt64) && !(b == -1 && a == math.MinInt64) {
+			return Decimal{small: r, scale: d.scale + e.scale}
+		}
+	}
+	return fromBig(new(big.Int).Mul(d.c(), e.c()), d.scale+e.scale)
 }
 
 // Neg returns -d.
@@ -224,7 +319,10 @@ func (d Decimal) Neg() Decimal {
 	if d.nan {
 		return d
 	}
-	return Decimal{coef: new(big.Int).Neg(d.c()), scale: d.scale}
+	if d.coef == nil && d.small != math.MinInt64 {
+		return Decimal{small: -d.small, scale: d.scale}
+	}
+	return fromBig(new(big.Int).Neg(d.c()), d.scale)
 }
 
 // Abs returns |d|.
@@ -319,7 +417,7 @@ func (d Decimal) DivScale(e Decimal, scale int32) (Decimal, error) {
 			q.Add(q, bigOne)
 		}
 	}
-	return Decimal{coef: q, scale: scale}, nil
+	return fromBig(q, scale), nil
 }
 
 // Mod returns the remainder of d/e with the sign of d.
@@ -332,7 +430,7 @@ func (d Decimal) Mod(e Decimal) (Decimal, error) {
 	}
 	s := maxI32(d.scale, e.scale)
 	r := new(big.Int).Rem(d.rescale(s), e.rescale(s))
-	return Decimal{coef: r, scale: s}, nil
+	return fromBig(r, s), nil
 }
 
 // Round rounds half away from zero to the given number of decimal places.
@@ -342,9 +440,27 @@ func (d Decimal) Round(scale int32) Decimal {
 		return d
 	}
 	if scale >= d.scale {
-		return Decimal{coef: d.rescale(scale), scale: scale}
+		if v, ok := d.rescaled(scale); ok {
+			return Decimal{small: v, scale: scale}
+		}
+		return fromBig(d.rescale(scale), scale)
 	}
 	drop := d.scale - scale
+	if d.coef == nil && drop <= 18 && scale >= 0 {
+		p := pow10i64[drop]
+		q, r := d.small/p, d.small%p
+		if r < 0 {
+			r = -r
+		}
+		if r >= p-r { // r*2 >= p without overflow
+			if d.small < 0 {
+				q--
+			} else {
+				q++
+			}
+		}
+		return Decimal{small: q, scale: scale}
+	}
 	p := pow10(drop)
 	q, r := new(big.Int).QuoRem(d.c(), p, new(big.Int))
 	r.Abs(r)
@@ -358,9 +474,9 @@ func (d Decimal) Round(scale int32) Decimal {
 	}
 	if scale < 0 {
 		q.Mul(q, pow10(-scale))
-		return Decimal{coef: q}
+		return fromBig(q, 0)
 	}
-	return Decimal{coef: q, scale: scale}
+	return fromBig(q, scale)
 }
 
 // Trunc truncates toward zero to the given scale.
@@ -372,18 +488,18 @@ func (d Decimal) Trunc(scale int32) Decimal {
 		scale = 0
 	}
 	q := new(big.Int).Quo(d.c(), pow10(d.scale-scale))
-	return Decimal{coef: q, scale: scale}
+	return fromBig(q, scale)
 }
 
 // Floor returns the greatest integer <= d.
 func (d Decimal) Floor() Decimal {
 	if d.nan || d.scale == 0 {
-		return Decimal{coef: d.c(), nan: d.nan}
+		return d
 	}
 	p := pow10(d.scale)
 	q, m := new(big.Int).DivMod(d.c(), p, new(big.Int))
 	_ = m
-	return Decimal{coef: q}
+	return fromBig(q, 0)
 }
 
 // Ceil returns the least integer >= d.
@@ -397,6 +513,14 @@ func (d Decimal) Normalize() Decimal {
 	if d.nan || d.scale == 0 {
 		return d
 	}
+	if d.coef == nil {
+		v, sc := d.small, d.scale
+		for sc > 0 && v%10 == 0 {
+			v /= 10
+			sc--
+		}
+		return Decimal{small: v, scale: sc}
+	}
 	c := new(big.Int).Set(d.c())
 	s := d.scale
 	r := new(big.Int)
@@ -408,13 +532,17 @@ func (d Decimal) Normalize() Decimal {
 		c = q
 		s--
 	}
-	return Decimal{coef: c, scale: s}
+	return fromBig(c, s)
 }
 
 // Float64 converts d to the nearest float64.
 func (d Decimal) Float64() float64 {
 	if d.nan {
 		return math.NaN()
+	}
+	// Exact operands give a correctly rounded quotient.
+	if d.coef == nil && d.small < 1<<53 && d.small > -(1<<53) && d.scale <= 22 {
+		return float64(d.small) / math.Pow10(int(d.scale))
 	}
 	f, _ := strconv.ParseFloat(d.String(), 64)
 	return f
@@ -468,5 +596,5 @@ func (d Decimal) Sqrt() (Decimal, error) {
 	// sqrt(c * 10^-s) at scale S: isqrt(c * 10^(2S - s)).
 	n := new(big.Int).Set(d.c())
 	n.Mul(n, pow10(2*scale-d.scale))
-	return Decimal{coef: new(big.Int).Sqrt(n), scale: scale}, nil
+	return fromBig(new(big.Int).Sqrt(n), scale), nil
 }

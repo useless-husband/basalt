@@ -294,7 +294,18 @@ func DecodeTuple(t *catalog.Table, tuple []byte) (Row, error) { return decodeTup
 // decodeTuple decodes the row part of a heap tuple for table t. Columns
 // added after the row was written get their recorded default.
 func decodeTuple(t *catalog.Table, tuple []byte) (Row, error) {
-	vals, err := types.DecodeRow(tuple[storage.TupleHeaderSize:], len(t.Columns))
+	return decodeTupleMask(t, tuple, nil)
+}
+
+// decodeTupleMask decodes only the columns marked in need (all if nil).
+func decodeTupleMask(t *catalog.Table, tuple []byte, need []bool) (Row, error) {
+	var vals Row
+	var err error
+	if need != nil {
+		vals, err = types.DecodeRowMask(tuple[storage.TupleHeaderSize:], len(t.Columns), need)
+	} else {
+		vals, err = types.DecodeRow(tuple[storage.TupleHeaderSize:], len(t.Columns))
+	}
 	if err != nil {
 		return nil, pgerr.New(pgerr.DataCorrupted, "corrupt tuple in table %s: %v", t.Name, err)
 	}

@@ -19,6 +19,7 @@ type tableReader struct {
 	filter  expr.Fn
 	ec      *expr.Ctx
 	stats   *planner.NodeStats
+	need    []bool
 }
 
 func (r *tableReader) row(tid storage.TID, tuple []byte) (Row, bool, error) {
@@ -26,7 +27,7 @@ func (r *tableReader) row(tid storage.TID, tuple []byte) (Row, bool, error) {
 	if !r.c.Txn.Visible(h) {
 		return nil, false, nil
 	}
-	vals, err := decodeTuple(r.t, tuple)
+	vals, err := decodeTupleMask(r.t, tuple, r.need)
 	if err != nil {
 		return nil, false, err
 	}
@@ -60,7 +61,7 @@ func (c *Ctx) newSeqScan(p *planner.SeqScanP) (Iter, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &seqScan{tableReader: tableReader{c: c, t: p.Table, withTID: p.TIDCol != 0, filter: f}, heap: c.Store.Heap(p.Table.Heap)}
+	s := &seqScan{tableReader: tableReader{c: c, t: p.Table, withTID: p.TIDCol != 0, filter: f, need: p.Need}, heap: c.Store.Heap(p.Table.Heap)}
 	if c.Analyze {
 		s.stats = planner.Stats(p)
 	}
@@ -119,7 +120,7 @@ func (c *Ctx) newIndexScan(p *planner.IndexScanP) (Iter, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &indexScan{tableReader: tableReader{c: c, t: p.Table, withTID: p.TIDCol != 0, filter: f}, p: p,
+	s := &indexScan{tableReader: tableReader{c: c, t: p.Table, withTID: p.TIDCol != 0, filter: f, need: p.Need}, p: p,
 		heap: c.Store.Heap(p.Table.Heap), tree: c.Store.BTree(p.Index.Root)}
 	if c.Analyze {
 		s.stats = planner.Stats(p)

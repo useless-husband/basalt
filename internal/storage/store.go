@@ -39,7 +39,7 @@ type Options struct {
 	// negative disables automatic checkpoints).
 	CheckpointInterval time.Duration
 	// CheckpointWALBytes triggers a checkpoint when this much WAL has been
-	// written since the last one (default 64 MiB).
+	// written since the last one (default 512 MiB).
 	CheckpointWALBytes int64
 }
 
@@ -94,7 +94,7 @@ func Open(opts Options) (*Store, error) {
 		opts.CheckpointInterval = 30 * time.Second
 	}
 	if opts.CheckpointWALBytes <= 0 {
-		opts.CheckpointWALBytes = 64 << 20
+		opts.CheckpointWALBytes = 512 << 20
 	}
 	fs := opts.FS
 	if err := fs.MkdirAll(opts.Dir); err != nil {

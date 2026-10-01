@@ -59,6 +59,9 @@ type SeqScanP struct {
 	TIDCol expr.ColumnID
 	Filter expr.Expr
 	Lock   bool
+	// Need marks the columns some operator reads (nil: all); the others
+	// are not decoded.
+	Need []bool
 }
 
 // IndexScanP reads rows through a B+tree index. Eq holds values for the
@@ -77,6 +80,7 @@ type IndexScanP struct {
 	Lock           bool
 	// IndexCond is the predicate the index bounds implement (EXPLAIN).
 	IndexCond expr.Expr
+	Need      []bool
 }
 
 // VScanP reads a virtual system table.
@@ -620,8 +624,16 @@ func nodeExprs(p Plan) []expr.Expr {
 		add(x.Cond)
 	case *HashJoinP:
 		add(x.Residual)
+		add(x.OuterKeys...)
+		add(x.InnerKeys...)
 	case *MergeJoinP:
 		add(x.Residual)
+		add(x.OuterKeys...)
+		add(x.InnerKeys...)
+	case *FuncScanP:
+		add(x.Args...)
+	case *LimitP:
+		add(x.Limit, x.Offset)
 	case *AggP:
 		add(x.GroupBy...)
 		for _, a := range x.Aggs {

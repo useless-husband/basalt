@@ -43,7 +43,49 @@ func (o *Optimizer) Optimize(n Node) (Plan, error) {
 	// The binder may have added columns since the optimizer was created.
 	o.cols = o.binder.cols
 	n = o.Rewriter.Rewrite(n)
-	return o.plan(n)
+	p, err := o.plan(n)
+	if err != nil {
+		return nil, err
+	}
+	markNeeded(p)
+	return p, nil
+}
+
+// markNeeded records, for every table scan of the plan, which of its
+// columns are read by some operator (or are part of the plan's output), so
+// that the others need not be decoded. Subquery plans are optimized, and
+// marked, separately; their correlated references count as reads here.
+func markNeeded(p Plan) {
+	used := usedColumns(p)
+	for _, id := range p.Layout() {
+		used[id] = true
+	}
+	var walk func(Plan)
+	walk = func(p Plan) {
+		var cols []expr.ColumnID
+		var need *[]bool
+		switch x := p.(type) {
+		case *SeqScanP:
+			cols, need = x.ColIDs, &x.Need
+		case *IndexScanP:
+			cols, need = x.ColIDs, &x.Need
+		}
+		if need != nil {
+			n := make([]bool, len(cols))
+			all := true
+			for i, id := range cols {
+				n[i] = used[id]
+				all = all && n[i]
+			}
+			if !all {
+				*need = n
+			}
+		}
+		for _, c := range p.children() {
+			walk(c)
+		}
+	}
+	walk(p)
 }
 
 // planExprs plans the subqueries contained in expressions.

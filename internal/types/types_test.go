@@ -3,6 +3,7 @@ package types
 import (
 	"bytes"
 	"math"
+	"math/big"
 	"math/rand"
 	"sort"
 	"testing"
@@ -323,5 +324,88 @@ func TestArrayText(t *testing.T) {
 	v, _ = Parse(`{"a b","c\"d",e}`, T{OidTextArray, -1})
 	if got := ToText(v, T{OidTextArray, -1}); got != `{"a b","c\"d",e}` {
 		t.Errorf("got %s", got)
+	}
+}
+
+// bigOnly forces the arbitrary-precision path.
+func bigOnly(d Decimal) Decimal {
+	if d.nan {
+		return d
+	}
+	return Decimal{coef: new(big.Int).Set(d.c()), scale: d.scale}
+}
+
+// TestDecimalFastPathMatchesBig checks every int64 fast path against the
+// math/big implementation on random operands, including values near the
+// int64 limits where the fast paths must fall back.
+func TestDecimalFastPathMatchesBig(t *testing.T) {
+	seed := int64(99)
+	r := rand.New(rand.NewSource(seed))
+	gen := func() Decimal {
+		var d Decimal
+		switch r.Intn(4) {
+		case 0:
+			d = Decimal{small: r.Int63n(1000) - 500, scale: int32(r.Intn(4))}
+		case 1:
+			d = Decimal{small: r.Int63() - r.Int63(), scale: int32(r.Intn(6))}
+		case 2:
+			v := int64(math.MaxInt64 - r.Int63n(10))
+			if r.Intn(2) == 0 {
+				v = math.MinInt64 + r.Int63n(10)
+			}
+			d = Decimal{small: v, scale: int32(r.Intn(3))}
+		default:
+			b, _ := new(big.Int).SetString("123456789012345678901234567890", 10)
+			d = fromBig(b.Mul(b, big.NewInt(r.Int63n(100)-50)), int32(r.Intn(5)))
+		}
+		return d
+	}
+	for i := 0; i < 20000; i++ {
+		a, b := gen(), gen()
+		ab, bb := bigOnly(a), bigOnly(b)
+		check := func(op string, fast, slow Decimal) {
+			if fast.String() != slow.String() {
+				t.Fatalf("seed %d: %s %s %s: fast %s, big %s", seed, a, op, b, fast, slow)
+			}
+		}
+		check("+", a.Add(b), ab.Add(bb))
+		check("-", a.Sub(b), ab.Sub(bb))
+		check("*", a.Mul(b), ab.Mul(bb))
+		check("neg", a.Neg(), ab.Neg())
+		check("round1", a.Round(1), ab.Round(1))
+		check("round-1", a.Round(-1), ab.Round(-1))
+		check("norm", a.Normalize(), ab.Normalize())
+		if a.Cmp(b) != ab.Cmp(bb) || a.Sign() != ab.Sign() {
+			t.Fatalf("seed %d: compare %s %s", seed, a, b)
+		}
+		if fa, fb := a.Float64(), ab.Float64(); fa != fb {
+			t.Fatalf("seed %d: Float64(%s) = %v, big %v", seed, a, fa, fb)
+		}
+	}
+}
+
+func TestDecodeRowMask(t *testing.T) {
+	iv, _ := ParseInterval("2 days")
+	big1, _ := ParseDecimal("123456789012345678901234567890.5")
+	vals := []Value{NewInt(7), NewText("skip me"), NewNumeric(mustDec(t, "-12.345")), NewNumeric(big1), NewInterval(iv),
+		NewArray(Int4, []Value{NewInt(1)}), NewFloat(1.5), Null, NewBool(true), NewText("keep")}
+	enc := EncodeRow(nil, vals)
+	for mask := 0; mask < 1<<len(vals); mask += 37 {
+		need := make([]bool, len(vals))
+		for i := range need {
+			need[i] = mask&(1<<i) != 0
+		}
+		got, err := DecodeRowMask(enc, len(vals), need)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, v := range vals {
+			if need[i] && (!Equal(got[i], v) || got[i].K != v.K) {
+				t.Fatalf("mask %b column %d: got %v want %v", mask, i, got[i], v)
+			}
+			if !need[i] && !got[i].IsNull() {
+				t.Fatalf("mask %b column %d should be skipped", mask, i)
+			}
+		}
 	}
 }

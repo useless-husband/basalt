@@ -285,9 +285,9 @@ func decodeNumericBinary(b []byte) (Decimal, error) {
 	var d Decimal
 	if exp >= 0 {
 		c.Mul(c, pow10(int32(exp)))
-		d = Decimal{coef: c}
+		d = fromBig(c, 0)
 	} else {
-		d = Decimal{coef: c, scale: int32(-exp)}
+		d = fromBig(c, int32(-exp))
 	}
 	if sign == 0x4000 {
 		d = d.Neg()
@@ -295,7 +295,7 @@ func decodeNumericBinary(b []byte) (Decimal, error) {
 	if d.scale > dscale {
 		d = d.Round(dscale)
 	} else if d.scale < dscale {
-		d = Decimal{coef: d.rescale(dscale), scale: dscale}
+		d = fromBig(d.rescale(dscale), dscale)
 	}
 	return d, nil
 }

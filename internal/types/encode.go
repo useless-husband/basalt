@@ -34,9 +34,19 @@ func encodeValue(dst []byte, v Value) []byte {
 	case KFloat:
 		dst = binary.BigEndian.AppendUint64(dst, uint64(v.I))
 	case KNumeric:
-		s := v.Num().String()
-		dst = binary.AppendUvarint(dst, uint64(len(s)))
-		dst = append(dst, s...)
+		// scale, then either 0 + zigzag int64 coefficient, 1 + text (NaN or
+		// coefficients beyond int64).
+		d := v.Num()
+		dst = binary.AppendUvarint(dst, uint64(d.scale))
+		if d.coef == nil && !d.nan {
+			dst = append(dst, 0)
+			dst = binary.AppendVarint(dst, d.small)
+		} else {
+			s := d.String()
+			dst = append(dst, 1)
+			dst = binary.AppendUvarint(dst, uint64(len(s)))
+			dst = append(dst, s...)
+		}
 	case KText, KBytea:
 		dst = binary.AppendUvarint(dst, uint64(len(v.S)))
 		dst = append(dst, v.S...)
@@ -54,6 +64,94 @@ func encodeValue(dst []byte, v Value) []byte {
 		}
 	}
 	return dst
+}
+
+// DecodeRowMask is DecodeRow that materializes only the columns whose need
+// entry is true (others stay NULL); variable-length values it skips are
+// not copied.
+func DecodeRowMask(b []byte, ncols int, need []bool) ([]Value, error) {
+	n, k := binary.Uvarint(b)
+	if k <= 0 {
+		return nil, errCorruptRow
+	}
+	b = b[k:]
+	if ncols < int(n) {
+		ncols = int(n)
+	}
+	out := make([]Value, ncols)
+	for i := 0; i < int(n); i++ {
+		if i < len(need) && !need[i] {
+			rest, err := skipValue(b)
+			if err != nil {
+				return nil, err
+			}
+			b = rest
+			continue
+		}
+		v, rest, err := decodeValue(b)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+		b = rest
+	}
+	return out, nil
+}
+
+// skipValue steps over one encoded value without building it.
+func skipValue(orig []byte) ([]byte, error) {
+	if len(orig) == 0 {
+		return nil, errCorruptRow
+	}
+	k := Kind(orig[0])
+	b := orig[1:]
+	switch k {
+	case KNull:
+		return b, nil
+	case KBool:
+		if len(b) < 1 {
+			return nil, errCorruptRow
+		}
+		return b[1:], nil
+	case KInt, KDate, KTimestamp, KTimestampTZ:
+		_, n := binary.Varint(b)
+		if n <= 0 {
+			return nil, errCorruptRow
+		}
+		return b[n:], nil
+	case KFloat:
+		if len(b) < 8 {
+			return nil, errCorruptRow
+		}
+		return b[8:], nil
+	case KText, KBytea:
+		l, n := binary.Uvarint(b)
+		if n <= 0 || uint64(len(b)-n) < l {
+			return nil, errCorruptRow
+		}
+		return b[n+int(l):], nil
+	case KNumeric:
+		_, n := binary.Uvarint(b)
+		if n <= 0 || len(b) <= n {
+			return nil, errCorruptRow
+		}
+		b = b[n:]
+		if b[0] == 0 {
+			_, m := binary.Varint(b[1:])
+			if m <= 0 {
+				return nil, errCorruptRow
+			}
+			return b[1+m:], nil
+		}
+		l, m := binary.Uvarint(b[1:])
+		if m <= 0 || uint64(len(b)-1-m) < l {
+			return nil, errCorruptRow
+		}
+		return b[1+m+int(l):], nil
+	}
+	// Rarer kinds (interval, array): decode and discard.
+	_, rest, err := decodeValue(orig)
+	return rest, err
 }
 
 // DecodeRow decodes a row produced by EncodeRow. If ncols is larger than
@@ -104,21 +202,34 @@ func decodeValue(b []byte) (Value, []byte, error) {
 			return Null, nil, errCorruptRow
 		}
 		return Value{K: KFloat, I: int64(binary.BigEndian.Uint64(b))}, b[8:], nil
-	case KNumeric, KText, KBytea:
+	case KNumeric:
+		scale, n := binary.Uvarint(b)
+		if n <= 0 || len(b) <= n {
+			return Null, nil, errCorruptRow
+		}
+		b = b[n:]
+		if b[0] == 0 {
+			c, m := binary.Varint(b[1:])
+			if m <= 0 {
+				return Null, nil, errCorruptRow
+			}
+			return NewNumeric(Decimal{small: c, scale: int32(scale)}), b[1+m:], nil
+		}
+		l, m := binary.Uvarint(b[1:])
+		if m <= 0 || uint64(len(b)-1-m) < l {
+			return Null, nil, errCorruptRow
+		}
+		d, err := ParseDecimal(string(b[1+m : 1+m+int(l)]))
+		if err != nil {
+			return Null, nil, errCorruptRow
+		}
+		return NewNumeric(d), b[1+m+int(l):], nil
+	case KText, KBytea:
 		l, n := binary.Uvarint(b)
 		if n <= 0 || uint64(len(b)-n) < l {
 			return Null, nil, errCorruptRow
 		}
-		s := string(b[n : n+int(l)])
-		rest := b[n+int(l):]
-		if k == KNumeric {
-			d, err := ParseDecimal(s)
-			if err != nil {
-				return Null, nil, errCorruptRow
-			}
-			return NewNumeric(d), rest, nil
-		}
-		return Value{K: k, S: s}, rest, nil
+		return Value{K: k, S: string(b[n : n+int(l)])}, b[n+int(l):], nil
 	case KInterval:
 		m, n1 := binary.Varint(b)
 		if n1 <= 0 {

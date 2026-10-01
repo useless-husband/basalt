@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"syscall"
 	"time"
 
@@ -29,7 +30,20 @@ func main() {
 	autovac := flag.Duration("autovacuum-interval", 10*time.Second, "how often autovacuum looks for work (0 disables)")
 	verbose := flag.Bool("v", false, "log connection errors")
 	noFsync := flag.Bool("unsafe-no-fsync", false, "never fsync (benchmarks only: a crash or power loss can lose or corrupt data)")
+	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of the server's lifetime to this file")
 	flag.Parse()
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "basalt: %v\n", err)
+			os.Exit(1)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "basalt: %v\n", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	level := slog.LevelInfo
 	if *verbose {
@@ -82,6 +96,7 @@ func main() {
 	srv.Close()
 	if err := db.Close(); err != nil {
 		log.Error("checkpoint at shutdown failed", "err", err)
+		pprof.StopCPUProfile()
 		os.Exit(1)
 	}
 }
