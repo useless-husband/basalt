@@ -4,7 +4,7 @@
 
 協定以下的一切都是 basalt 自己的程式碼：以分頁為單位的儲存引擎（緩衝池、預寫式日誌、B+ 樹、當機復原）、具快照隔離的 MVCC 交易、SQL 解析器、以成本為基礎的查詢規劃器和執行器。沒有內嵌 SQLite 或 PostgreSQL，也沒有使用第三方 SQL 解析器；唯一的相依套件是測試用的客戶端驅動程式。
 
-這個專案的目的，是用一個人讀得完的規模（約兩萬九千行 Go）呈現真正的資料庫各個部分如何組合在一起，並且用真實的客戶端和其他資料庫引擎來驗證，而不是只用自己的假設驗證自己。它是單機的研究與教學系統，不適合存放重要資料。
+這個專案的目的，是用一個人讀得完的規模（約三萬行 Go，另有四千行測試）呈現真正的資料庫各個部分如何組合在一起，並且用真實的客戶端和其他資料庫引擎來驗證，而不是只用自己的假設驗證自己。它是單機的研究與教學系統，不適合存放重要資料。
 
 [English](README.md) · [設計文件](docs/DESIGN.md) · [導讀（給初學者）](docs/導讀.zh-TW.md)
 
@@ -160,8 +160,8 @@ python3 bench/tpcb/sqlite_tpcb.py --scale 8 --clients 1,8 --duration 20
 這些數字老實地說明了：
 
 - **持久化的提交受限於硬碟 flush。** 這台機器上 `F_FULLFSYNC` 約需 4 毫秒，所以單一客戶端在兩個引擎上都大約每秒 250 次提交。客戶端變多時，basalt 的群組提交讓等待中的交易共用一次 flush（8 個客戶端 602、16 個 754），而 SQLite 的單一寫入者只能一個一個來。basalt 剩下的瓶頸是 8 個分行資料列的競爭：每一列都要被持有到該交易的 flush 完成。
-- **不 flush 時，SQLite 每筆交易還是比較快。** 同一行程、單一客戶端時，SQLite 每秒約 30,900 筆交易，basalt 約 24,000：basalt 每次更新都要寫新版本的資料列和新的索引項目、每筆交易記錄約 4 KB 的頁面差異，並用通用的迭代器執行計畫。經 TCP 時 basalt 每筆交易還要付出七次網路往返（單一客戶端 4,846）。basalt 能隨客戶端數擴展（同一行程 8 個客戶端 39,447），SQLite 不能，但這不是對等的比較：SQLite 本來就不嘗試讓寫入者並行。
-- **單一客戶端的數字是成本模型決定的。** 用 PostgreSQL 的 `random_page_cost` 預設值 4 時，basalt 把只有 8 列的分行表的更新規劃成循序掃描，而循序掃描要讀過上次 VACUUM 以來留下的每一個失效版本（basalt 在兩次 VACUUM 之間不會清理頁面）。這時同一行程的單一客戶端每秒只有約 3,000 筆交易；`go run ./bench/tpcb -embedded -scale 8 -clients 1,8 -duration 10s -set random_page_cost=4` 可以重現，並會印出計畫。用 basalt 的預設值 1.1 時，這個更新會走主鍵索引。為什麼 8 個客戶端沒有受到同樣的影響（兩種設定都約 41,600），我沒有查清楚。
+- **不 flush 時，SQLite 每筆交易還是比較快。** 同一行程、單一客戶端時，SQLite 每秒約 30,900 筆交易，basalt 約 24,000：basalt 每次更新都要寫新版本的資料列和新的索引項目、每筆交易記錄 4 到 6 KB 的頁面差異與整頁影本，並用通用的迭代器執行計畫。經 TCP 時 basalt 每筆交易還要付出七次網路往返（單一客戶端 4,846）。basalt 能隨客戶端數擴展（同一行程 8 個客戶端 39,447），SQLite 不能，但這不是對等的比較：SQLite 本來就不嘗試讓寫入者並行。
+- **單一客戶端的數字是成本模型決定的。** 用 PostgreSQL 的 `random_page_cost` 預設值 4 時，basalt 把只有 8 列的分行表的更新規劃成循序掃描，而循序掃描要讀過上次 VACUUM 以來留下的每一個失效版本（basalt 在兩次 VACUUM 之間不會清理頁面）。這時同一行程的單一客戶端每秒只有約 3,000 筆交易；`go run ./bench/tpcb -embedded -scale 8 -clients 1,8 -duration 10s -set random_page_cost=4` 可以重現，並會印出計畫。用 basalt 的預設值 1.1 時，這個更新會走主鍵索引。為什麼 8 個客戶端沒有受到同樣的影響（兩種設定都約 42,000），我沒有查清楚。
 
 ### 分析型查詢
 
@@ -193,6 +193,7 @@ python3 bench/analytics/run.py --basalt bin/basalt --scale 1 --repeat 5 --plans
 - 沒有 SERIALIZABLE 隔離（SSI）；REPEATABLE READ 允許寫入偏斜，與 PostgreSQL 相同。沒有 savepoint、`SELECT ... FOR UPDATE`、`LOCK`、`LISTEN/NOTIFY`（接受但忽略）或 prepared transaction。
 - 未實作：view、trigger、預存程序、視窗函式、遞迴 CTE、LATERAL、`DROP COLUMN`、部分索引或運算式索引、遞減索引順序與反向索引掃描、多維陣列、二進位 COPY、UTC 以外的時區、C 以外的定序。
 - 一列資料必須放得進一頁（約 8 KB）；沒有 TOAST。
+- 失效的資料列版本會留在頁面裡直到 VACUUM（autovacuum 每 10 秒檢查一次，失效列數超過 50 + 20% 時才清理，與 PostgreSQL 的預設門檻相同）；中間沒有頁面清理（page pruning）或 HOT 更新，所以經常被更新的表，循序掃描時會讀到每一個失效版本。
 - 只有在 WHERE 裡當作 AND 條件之一的相關 `EXISTS`、`NOT EXISTS` 和 `IN` 會被轉成連接。相關的純量子查詢、`NOT IN`，以及放在 OR 底下的子查詢，仍然對每一列外層資料執行一次（有索引時走索引）。
 - `numeric` 的結果是精確的。位數放得進 64 位元的值走快速路徑；更大的值用 `math/big`，慢很多。
 - 尖銳檢查點在寫回髒頁時會暫停寫入。同一個索引的 B+ 樹寫入者會排隊。DDL 由持有到提交為止的目錄鎖序列化。
