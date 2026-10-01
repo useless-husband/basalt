@@ -319,7 +319,7 @@ func Explain(p Plan, opt ExplainOptions) []string {
 		if depth > 0 {
 			prefix = indent + "  ->  "
 		}
-		detail := strings.Repeat("      ", depth)
+		detail := "  "
 		if depth > 0 {
 			detail = indent + "        "
 		}

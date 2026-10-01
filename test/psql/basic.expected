@@ -1,0 +1,274 @@
+-- basalt driven by psql: schema, catalog commands, queries, errors,
+-- transactions and EXPLAIN. Output is compared with basic.expected.
+CREATE TABLE customers (
+    id      serial PRIMARY KEY,
+    name    text NOT NULL,
+    email   varchar(64) UNIQUE,
+    country char(2) DEFAULT 'TW',
+    joined  date NOT NULL DEFAULT '2024-01-01',
+    CHECK (length(name) > 0)
+);
+CREATE TABLE
+CREATE TABLE orders (
+    id          bigserial PRIMARY KEY,
+    customer_id int NOT NULL REFERENCES customers (id) ON DELETE CASCADE,
+    amount      numeric(10,2) NOT NULL CHECK (amount > 0),
+    placed      timestamp NOT NULL,
+    note        text
+);
+CREATE TABLE
+CREATE INDEX orders_customer_idx ON orders (customer_id);
+CREATE INDEX
+\dt
+           List of tables
+ Schema |   Name    | Type  | Owner  
+--------+-----------+-------+--------
+ public | customers | table | basalt
+ public | orders    | table | basalt
+(2 rows)
+
+\d customers
+                                    Table "public.customers"
+ Column  |         Type          | Collation | Nullable |                Default                
+---------+-----------------------+-----------+----------+---------------------------------------
+ id      | integer               |           | not null | nextval('customers_id_seq'::regclass)
+ name    | text                  |           | not null | 
+ email   | character varying(64) |           |          | 
+ country | character(2)          |           |          | 'TW'
+ joined  | date                  |           | not null | '2024-01-01'
+Indexes:
+    "customers_pkey" PRIMARY KEY, btree (id)
+    "customers_email_key" UNIQUE CONSTRAINT, btree (email)
+Check constraints:
+    "customers_check" CHECK (length(name) > 0)
+Referenced by:
+    TABLE "orders" CONSTRAINT "orders_customer_id_fkey" FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+
+\d orders
+                                         Table "public.orders"
+   Column    |            Type             | Collation | Nullable |              Default               
+-------------+-----------------------------+-----------+----------+------------------------------------
+ id          | bigint                      |           | not null | nextval('orders_id_seq'::regclass)
+ customer_id | integer                     |           | not null | 
+ amount      | numeric(10,2)               |           | not null | 
+ placed      | timestamp without time zone |           | not null | 
+ note        | text                        |           |          | 
+Indexes:
+    "orders_pkey" PRIMARY KEY, btree (id)
+    "orders_customer_idx" btree (customer_id)
+Check constraints:
+    "orders_amount_check" CHECK (amount > 0)
+Foreign-key constraints:
+    "orders_customer_id_fkey" FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+
+\di
+                      List of indexes
+ Schema |        Name         | Type  | Owner  |   Table   
+--------+---------------------+-------+--------+-----------
+ public | customers_email_key | index | basalt | customers
+ public | customers_pkey      | index | basalt | customers
+ public | orders_customer_idx | index | basalt | orders
+ public | orders_pkey         | index | basalt | orders
+(4 rows)
+
+INSERT INTO customers (name, email, country) VALUES
+    ('Ada', 'ada@example.org', 'GB'),
+    ('Lin', 'lin@example.org', DEFAULT),
+    ('Sam', NULL, 'US');
+INSERT 0 3
+INSERT INTO orders (customer_id, amount, placed, note) VALUES
+    (1, 120.50, '2024-03-01 10:00', 'first'),
+    (1, 30.00,  '2024-03-05 18:30', NULL),
+    (2, 99.99,  '2024-03-02 09:15', 'gift'),
+    (2, 15.25,  '2024-04-11 12:00', NULL),
+    (3, 7.00,   '2024-04-12 08:45', 'tiny')
+RETURNING id, customer_id, amount;
+ id | customer_id | amount 
+----+-------------+--------
+  1 |           1 | 120.50
+  2 |           1 |  30.00
+  3 |           2 |  99.99
+  4 |           2 |  15.25
+  5 |           3 |   7.00
+(5 rows)
+
+INSERT 0 5
+\copy orders (customer_id, amount, placed) from stdin
+COPY 2
+SELECT c.name, count(o.id) AS orders, sum(o.amount) AS total, max(o.placed)::date AS last
+FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name
+ORDER BY total DESC;
+ name | orders | total  |    last    
+------+--------+--------+------------
+ Ada  |      3 | 159.25 | 2024-05-02
+ Lin  |      2 | 115.24 | 2024-04-11
+ Sam  |      2 |  49.00 | 2024-05-01
+(3 rows)
+
+SELECT name, country,
+       (SELECT avg(amount) FROM orders o WHERE o.customer_id = c.id) AS avg_amount
+FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 50)
+ORDER BY name;
+ name | country |     avg_amount      
+------+---------+---------------------
+ Ada  | GB      | 53.0833333333333333
+ Lin  | TW      | 57.6200000000000000
+(2 rows)
+
+WITH monthly AS (
+    SELECT date_trunc('month', placed) AS month, sum(amount) AS total
+    FROM orders GROUP BY 1
+)
+SELECT month::date, total,
+       CASE WHEN total > 100 THEN 'busy' ELSE 'quiet' END AS kind
+FROM monthly ORDER BY month;
+   month    | total  | kind  
+------------+--------+-------
+ 2024-03-01 | 250.49 | busy
+ 2024-04-01 |  22.25 | quiet
+ 2024-05-01 |  50.75 | quiet
+(3 rows)
+
+SELECT customer_id FROM orders WHERE amount > 100
+UNION
+SELECT id FROM customers WHERE country = 'US'
+ORDER BY 1;
+ customer_id 
+-------------
+           1
+           3
+(2 rows)
+
+-- NULL semantics
+SELECT NULL = NULL AS eq, NULL IS NULL AS is_null, 1 IN (2, NULL) AS in_null,
+       1 NOT IN (2, NULL) AS not_in_null, coalesce(NULL, 'x') AS coalesced,
+       count(note) AS non_null_notes, count(*) AS all_rows
+FROM orders;
+ eq | is_null | in_null | not_in_null | coalesced | non_null_notes | all_rows 
+----+---------+---------+-------------+-----------+----------------+----------
+    | t       |         |             | x         |              3 |        7
+(1 row)
+
+SELECT note, count(*) FROM orders GROUP BY note ORDER BY note NULLS FIRST;
+ note  | count 
+-------+-------
+       |     4
+ first |     1
+ gift  |     1
+ tiny  |     1
+(4 rows)
+
+-- errors with SQLSTATE codes
+\set VERBOSITY verbose
+INSERT INTO customers (name, email) VALUES ('Dup', 'ada@example.org');
+psql:basic.sql:77: ERROR:  23505: duplicate key value violates unique constraint "customers_email_key"
+DETAIL:  Key (email)=(ada@example.org) already exists.
+TABLE NAME:  customers
+CONSTRAINT NAME:  customers_email_key
+INSERT INTO orders (customer_id, amount, placed) VALUES (99, 1, now());
+psql:basic.sql:78: ERROR:  23503: insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(99) is not present in table "customers".
+TABLE NAME:  orders
+CONSTRAINT NAME:  orders_customer_id_fkey
+INSERT INTO orders (customer_id, amount, placed) VALUES (1, -5, now());
+psql:basic.sql:79: ERROR:  23514: new row for relation "orders" violates check constraint "orders_amount_check"
+TABLE NAME:  orders
+CONSTRAINT NAME:  orders_amount_check
+SELECT amount / 0 FROM orders LIMIT 1;
+psql:basic.sql:80: ERROR:  22012: division by zero
+SELECT nosuchcolumn FROM orders;
+psql:basic.sql:81: ERROR:  42703: column "nosuchcolumn" does not exist
+LINE 1: SELECT nosuchcolumn FROM orders;
+               ^
+\set VERBOSITY default
+-- transactions
+BEGIN;
+BEGIN
+UPDATE orders SET amount = amount * 2 WHERE customer_id = 1;
+UPDATE 3
+SELECT sum(amount) FROM orders WHERE customer_id = 1;
+  sum   
+--------
+ 318.50
+(1 row)
+
+ROLLBACK;
+ROLLBACK
+SELECT sum(amount) FROM orders WHERE customer_id = 1;
+  sum   
+--------
+ 159.25
+(1 row)
+
+BEGIN;
+BEGIN
+DELETE FROM customers WHERE id = 3;
+DELETE 1
+SELECT oops;
+psql:basic.sql:93: ERROR:  column "oops" does not exist
+LINE 1: SELECT oops;
+               ^
+SELECT 1;
+psql:basic.sql:94: ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+ROLLBACK
+SELECT count(*) FROM customers;
+ count 
+-------
+     3
+(1 row)
+
+DELETE FROM customers WHERE id = 3;
+DELETE 1
+SELECT count(*) AS orders_left FROM orders;
+ orders_left 
+-------------
+           5
+(1 row)
+
+-- the planner
+ANALYZE;
+ANALYZE
+EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE id = 3;
+        QUERY PLAN         
+---------------------------
+ Seq Scan on orders
+   Filter: (orders.id = 3)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.country = 'GB';
+                    QUERY PLAN                    
+--------------------------------------------------
+ Nested Loop
+   Join Filter: (o.customer_id = c.id)
+   ->  Seq Scan on customers c
+         Filter: (c.country = 'GB'::character(2))
+   ->  Materialize
+         ->  Seq Scan on orders o
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT customer_id, sum(amount) FROM orders GROUP BY customer_id ORDER BY 2 DESC LIMIT 2;
+                 QUERY PLAN                  
+---------------------------------------------
+ Limit
+   ->  Sort (top-N)
+         Sort Key: sum(orders.amount) DESC
+         ->  HashAggregate
+               Group Key: orders.customer_id
+               ->  Seq Scan on orders
+(6 rows)
+
+SHOW server_version;
+ server_version 
+----------------
+ 16.4
+(1 row)
+
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
