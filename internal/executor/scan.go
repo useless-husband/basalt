@@ -30,9 +30,6 @@ func (r *tableReader) row(tid storage.TID, tuple []byte) (Row, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if n := storedColumns(tuple); n < len(r.t.Columns) {
-		fillMissing(r.t, vals, n)
-	}
 	if r.withTID {
 		vals = append(vals, types.NewInt(int64(tid)))
 	}

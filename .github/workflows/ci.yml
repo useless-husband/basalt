@@ -35,9 +35,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: install psql
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: install psql 18 (the expected output was recorded with psql 18)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-18
       - run: test/psql/run.sh
+        env:
+          PSQL: /usr/lib/postgresql/18/bin/psql
       - run: python -m pip install "psycopg[binary]"
       - run: python test/python/test_psycopg.py
 

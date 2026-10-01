@@ -288,7 +288,11 @@ func Drain(it Iter, ec *expr.Ctx) ([]Row, error) {
 
 // ---- tuples ----
 
-// decodeTuple decodes the row part of a heap tuple for table t into dst.
+// DecodeTuple decodes the row of a heap tuple of table t (see decodeTuple).
+func DecodeTuple(t *catalog.Table, tuple []byte) (Row, error) { return decodeTuple(t, tuple) }
+
+// decodeTuple decodes the row part of a heap tuple for table t. Columns
+// added after the row was written get their recorded default.
 func decodeTuple(t *catalog.Table, tuple []byte) (Row, error) {
 	vals, err := types.DecodeRow(tuple[storage.TupleHeaderSize:], len(t.Columns))
 	if err != nil {
@@ -296,6 +300,9 @@ func decodeTuple(t *catalog.Table, tuple []byte) (Row, error) {
 	}
 	if len(vals) > len(t.Columns) {
 		vals = vals[:len(t.Columns)]
+	}
+	if n := storedColumns(tuple); n < len(t.Columns) {
+		fillMissing(t, vals, n)
 	}
 	return vals, nil
 }

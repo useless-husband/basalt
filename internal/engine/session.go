@@ -144,10 +144,8 @@ func (db *DB) NewSession(user, database string) *Session {
 
 // Close ends the session, rolling back any open transaction.
 func (s *Session) Close() {
-	if s.txn != nil {
-		s.txn.Abort()
-		s.txn = nil
-	}
+	// Roll back (running the undo actions of any DDL) and release locks.
+	_ = s.endTxn(false)
 	s.db.unregister(s)
 }
 

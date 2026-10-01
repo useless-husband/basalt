@@ -183,3 +183,74 @@ func TestTransactionalDDL(t *testing.T) {
 	q(t, s, `COMMIT`)
 	qerr(t, other, `SELECT extra FROM t`, pgerr.UndefinedColumn)
 }
+
+// TestAddColumnDefault checks that rows written before ADD COLUMN ... DEFAULT
+// show the default on every path that reads them.
+func TestAddColumnDefault(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("t", "t")
+	q(t, s, `CREATE TABLE p (id int PRIMARY KEY)`)
+	q(t, s, `CREATE TABLE c (id int PRIMARY KEY, pid int REFERENCES p ON UPDATE CASCADE)`)
+	q(t, s, `INSERT INTO p VALUES (1), (2)`)
+	q(t, s, `INSERT INTO c VALUES (10, 1), (20, 2)`)
+	q(t, s, `ALTER TABLE c ADD COLUMN flag text DEFAULT 'old'`)
+	q(t, s, `INSERT INTO c VALUES (30, 1, 'new')`)
+	expect(t, s, `SELECT id, flag FROM c ORDER BY id`, "10|old\n20|old\n30|new")
+	// The cascade rewrites child rows; the default must survive.
+	q(t, s, `UPDATE p SET id = 5 WHERE id = 1`)
+	expect(t, s, `SELECT id, pid, flag FROM c ORDER BY id`, "10|5|old\n20|2|old\n30|5|new")
+	q(t, s, `CREATE INDEX c_flag ON c (flag)`)
+	q(t, s, `SET enable_seqscan = off`)
+	expect(t, s, `SELECT count(*) FROM c WHERE flag = 'old'`, "2")
+	q(t, s, `ANALYZE c`)
+	q(t, s, `VACUUM c`)
+	expect(t, s, `SELECT count(*) FROM c WHERE flag = 'old'`, "2")
+	cs := db.Catalog().TableByName("c").Stats.Columns[2]
+	if cs.NullFrac != 0 {
+		t.Fatalf("statistics see NULLs in a defaulted column: %+v", cs)
+	}
+}
+
+func TestForeignKeyActions(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("t", "t")
+	q(t, s, `CREATE TABLE country (code char(2) PRIMARY KEY)`)
+	q(t, s, `CREATE TABLE city (id int PRIMARY KEY, country char(2) REFERENCES country ON DELETE CASCADE ON UPDATE CASCADE)`)
+	q(t, s, `CREATE TABLE street (id int PRIMARY KEY, city int REFERENCES city ON DELETE CASCADE)`)
+	q(t, s, `CREATE TABLE note (id int PRIMARY KEY, city int REFERENCES city ON DELETE SET NULL)`)
+	q(t, s, `CREATE TABLE pin (id int PRIMARY KEY, city int REFERENCES city)`) // NO ACTION
+	q(t, s, `INSERT INTO country VALUES ('TW'), ('JP')`)
+	q(t, s, `INSERT INTO city VALUES (1, 'TW'), (2, 'TW'), (3, 'JP')`)
+	q(t, s, `INSERT INTO street VALUES (100, 1), (101, 1), (102, 3)`)
+	q(t, s, `INSERT INTO note VALUES (7, 2)`)
+	q(t, s, `INSERT INTO pin VALUES (9, 3)`)
+	// Cascading delete two levels deep; SET NULL on a third table.
+	q(t, s, `DELETE FROM city WHERE id = 1 OR id = 2`)
+	expect(t, s, `SELECT count(*) FROM street`, "1")
+	expect(t, s, `SELECT city IS NULL FROM note`, "t")
+	// NO ACTION blocks deleting a referenced row, also through a cascade.
+	qerr(t, s, `DELETE FROM city WHERE id = 3`, pgerr.ForeignKeyViolation)
+	qerr(t, s, `DELETE FROM country WHERE code = 'JP'`, pgerr.ForeignKeyViolation)
+	expect(t, s, `SELECT count(*) FROM city`, "1") // the failed statement changed nothing
+	// ON UPDATE CASCADE rewrites the referencing column.
+	q(t, s, `UPDATE country SET code = 'NP' WHERE code = 'JP'`)
+	expect(t, s, `SELECT country FROM city WHERE id = 3`, "NP")
+	// Updating a key that is referenced without ON UPDATE fails.
+	qerr(t, s, `UPDATE city SET id = 30 WHERE id = 3`, pgerr.ForeignKeyViolation)
+	// Self-reference and composite keys.
+	q(t, s, `CREATE TABLE emp (id int PRIMARY KEY, boss int REFERENCES emp)`)
+	q(t, s, `INSERT INTO emp VALUES (1, NULL), (2, 1), (3, 2)`)
+	qerr(t, s, `INSERT INTO emp VALUES (4, 99)`, pgerr.ForeignKeyViolation)
+	qerr(t, s, `DELETE FROM emp WHERE id = 2`, pgerr.ForeignKeyViolation)
+	q(t, s, `CREATE TABLE pair (a int, b int, PRIMARY KEY (a, b))`)
+	q(t, s, `CREATE TABLE ref2 (x int, y int, FOREIGN KEY (x, y) REFERENCES pair (a, b))`)
+	q(t, s, `INSERT INTO pair VALUES (1, 2)`)
+	q(t, s, `INSERT INTO ref2 VALUES (1, 2), (NULL, 5)`) // a NULL column skips the check (MATCH SIMPLE)
+	qerr(t, s, `INSERT INTO ref2 VALUES (2, 1)`, pgerr.ForeignKeyViolation)
+	// A referenced table cannot be dropped or truncated without CASCADE.
+	qerr(t, s, `DROP TABLE pair`, "2BP01")
+	q(t, s, `DROP TABLE pair CASCADE`)
+	q(t, s, `INSERT INTO ref2 VALUES (8, 8)`) // the constraint went with it
+}

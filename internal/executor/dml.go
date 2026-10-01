@@ -692,10 +692,12 @@ func (o *tableOps) updateRow(tid storage.TID, old, newVals Row, depth int) (bool
 	if err := o.checkOutgoingFKs(newVals, old); err != nil {
 		return false, err
 	}
-	if err := o.checkIncomingFKs(old, newVals, depth); err != nil {
+	// The new version goes in before referencing rows are cascaded, so
+	// that their foreign key checks find the new key.
+	if _, _, _, err := o.insertVersion(newVals, old, false); err != nil {
 		return false, err
 	}
-	if _, _, _, err := o.insertVersion(newVals, old, false); err != nil {
+	if err := o.checkIncomingFKs(old, newVals, depth); err != nil {
 		return false, err
 	}
 	if o.c.TableChanged != nil {
@@ -820,9 +822,6 @@ func (it *insertIter) upsert(tid storage.TID, excluded Row) (Row, bool, error) {
 	existing, err := decodeTuple(o.t, tuple)
 	if err != nil {
 		return nil, false, err
-	}
-	if n := storedColumns(tuple); n < len(o.t.Columns) {
-		fillMissing(o.t, existing, n)
 	}
 	both := concat(existing, excluded)
 	if it.whereFn != nil {

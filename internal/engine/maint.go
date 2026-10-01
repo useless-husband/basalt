@@ -154,19 +154,18 @@ func (db *DB) gatherStats(ctx context.Context, tx *txn.Txn, t *catalog.Table) (*
 				return nil, err
 			}
 		}
-		var vals []types.Value
 		if len(sample) < analyzeSample {
-			vals, err = types.DecodeRow(tuple[storage.TupleHeaderSize:], len(t.Columns))
+			vals, err := executor.DecodeTuple(t, tuple)
 			if err != nil {
 				return nil, err
 			}
-			sample = append(sample, vals[:len(t.Columns)])
+			sample = append(sample, vals)
 		} else if j := r.IntN(total); j < analyzeSample {
-			vals, err = types.DecodeRow(tuple[storage.TupleHeaderSize:], len(t.Columns))
+			vals, err := executor.DecodeTuple(t, tuple)
 			if err != nil {
 				return nil, err
 			}
-			sample[j] = vals[:len(t.Columns)]
+			sample[j] = vals
 		}
 	}
 	st := &catalog.TableStats{Rows: float64(total), Pages: heap.PageCount()}

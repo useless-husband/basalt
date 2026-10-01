@@ -39,9 +39,6 @@ func (c *Ctx) BuildIndex(t *catalog.Table, ix *catalog.Index) error {
 		if err != nil {
 			return err
 		}
-		if s := storedColumns(tuple); s < len(t.Columns) {
-			fillMissing(t, vals, s)
-		}
 		live, wait := c.liveDirty(h)
 		if ix.Unique && (live || wait != 0) {
 			if _, err := o.insertIndex(ix, vals, tid); err != nil {
@@ -82,9 +79,6 @@ func (c *Ctx) ValidateTable(t *catalog.Table) error {
 		vals, err := decodeTuple(t, tuple)
 		if err != nil {
 			return err
-		}
-		if s := storedColumns(tuple); s < len(t.Columns) {
-			fillMissing(t, vals, s)
 		}
 		if err := o.validate(vals); err != nil {
 			return err
@@ -145,9 +139,6 @@ func (c *Ctx) Vacuum(t *catalog.Table, horizon uint64) (VacuumStats, error) {
 			vals, err := decodeTuple(t, tuple)
 			if err != nil {
 				return st, err
-			}
-			if s := storedColumns(tuple); s < len(t.Columns) {
-				fillMissing(t, vals, s)
 			}
 			tid := storage.MakeTID(pid, slot)
 			for _, ix := range indexes {
