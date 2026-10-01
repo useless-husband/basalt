@@ -1,0 +1,11 @@
+/basalt
+/bin/
+/dist/
+*.test
+*.out
+*.prof
+coverage.out
+/data/
+.venv/
+__pycache__/
+/testdata/sqllogictest/
