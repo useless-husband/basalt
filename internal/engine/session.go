@@ -56,6 +56,7 @@ type Session struct {
 	secret   int32
 	user     string
 	database string
+	appName  string // application_name from the startup packet (read by other sessions)
 
 	txn       *txn.Txn
 	explicit  bool
@@ -163,6 +164,8 @@ func (s *Session) SetStartupParameter(k, v string) {
 	switch strings.ToLower(k) {
 	case "user", "database", "replication":
 		return
+	case "application_name":
+		s.appName = v
 	case "options":
 		// -c name=value pairs.
 		for _, f := range strings.Fields(v) {

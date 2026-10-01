@@ -246,7 +246,9 @@ func (t *Txn) AssignXid() (uint64, error) {
 // drops the snapshot so the statement takes a new one.
 func (t *Txn) NewStatement() {
 	if t.ReadCommitted {
+		t.m.mu.Lock() // OldestXmin reads Snap under the same lock
 		t.Snap = nil
+		t.m.mu.Unlock()
 	}
 }
 

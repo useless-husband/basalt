@@ -353,7 +353,7 @@ func (s *Session) virtualTable(schema, name string) (*planner.VirtualTable, bool
 			defer s.db.sessMu.Unlock()
 			var out [][]types.Value
 			for pid, ss := range s.db.sessions {
-				out = append(out, []types.Value{vText(ss.database), vInt(pid), vText(ss.user), vText(ss.settings["application_name"]), vText("active"), vText("")})
+				out = append(out, []types.Value{vText(ss.database), vInt(pid), vText(ss.user), vText(ss.appName), vText("active"), vText("")})
 			}
 			sortRows(out, 1)
 			return out
