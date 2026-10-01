@@ -524,6 +524,13 @@ func (p *Parser) parseSet() (Stmt, error) {
 		}
 		st.Name = "transaction"
 		st.TxnIsolation = ts.Isolation
+		if sessionChars {
+			st.Name = "default_transaction_isolation"
+			st.Value = ts.Isolation
+			if st.Value == "" {
+				st.Reset = true
+			}
+		}
 		return st, nil
 	}
 	if p.acceptKw("time", "zone") {

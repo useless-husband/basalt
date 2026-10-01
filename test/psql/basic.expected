@@ -269,6 +269,18 @@ SHOW server_version;
 SHOW transaction_isolation;
  transaction_isolation 
 -----------------------
+ read committed
+(1 row)
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+BEGIN
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
  repeatable read
 (1 row)
 
+COMMIT;
+COMMIT
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+psql:basic.sql:112: ERROR:  SERIALIZABLE isolation is not supported; basalt provides snapshot isolation (REPEATABLE READ)

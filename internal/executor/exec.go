@@ -40,6 +40,49 @@ type Ctx struct {
 	checks       map[uint32][]checkFn
 	// TableChanged is called after rows of a table are modified.
 	TableChanged func(oid uint32, inserted, deleted int64)
+	// touched records the tuple changes of the statement so that a READ
+	// COMMITTED statement can be undone and restarted.
+	touched []touch
+}
+
+type touch struct {
+	heap   *storage.Heap
+	tid    storage.TID
+	locked bool // xmax set on an existing version (else: new version)
+}
+
+// RestartError tells the caller that a READ COMMITTED statement met a row
+// changed by a transaction that committed after the statement's snapshot;
+// the statement must be undone (Undo) and run again with a new snapshot.
+type RestartError struct{ Err error }
+
+func (e *RestartError) Error() string { return e.Err.Error() }
+
+// Undo reverts the tuple changes made so far by the current statement:
+// its new versions become invisible to everyone and the versions it
+// locked are released.
+func (c *Ctx) Undo() error {
+	xid, cid := c.Txn.Xid, c.Txn.Cid
+	for i := len(c.touched) - 1; i >= 0; i-- {
+		t := c.touched[i]
+		_, err := t.heap.ModifyHeader(t.tid, func(h *storage.TupleHeader) error {
+			if t.locked {
+				if h.Xmax == xid && h.Cmax == cid {
+					h.Xmax, h.Cmax = 0, 0
+					h.Flags &^= storage.FlagUpdated | storage.FlagLockOnly
+				}
+			} else if h.Xmin == xid && h.Cmin == cid {
+				h.Flags |= storage.FlagKilled
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	c.touched = nil
+	c.RowsAffected = 0
+	return nil
 }
 
 type checkFn struct {

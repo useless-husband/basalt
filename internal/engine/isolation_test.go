@@ -11,10 +11,10 @@ import (
 	"github.com/useless-husband/basalt/internal/pgerr"
 )
 
-// These tests demonstrate which anomalies snapshot isolation prevents
-// (dirty read, non-repeatable read, phantom, lost update, read skew) and
-// the one it allows (write skew), using two sessions with interleaved
-// statements.
+// These tests demonstrate which anomalies snapshot isolation (REPEATABLE
+// READ) prevents (dirty read, non-repeatable read, phantom, lost update,
+// read skew) and the one it allows (write skew), and how READ COMMITTED
+// behaves, using two sessions with interleaved statements.
 
 func setupKV(t *testing.T) (*DB, *Session, *Session) {
 	t.Helper()
@@ -37,7 +37,7 @@ func TestNoDirtyRead(t *testing.T) {
 
 func TestNoNonRepeatableRead(t *testing.T) {
 	_, a, b := setupKV(t)
-	q(t, a, `BEGIN`)
+	q(t, a, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
 	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "10")
 	q(t, b, `UPDATE kv SET v = 11 WHERE k = 'x'`)
 	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "10")
@@ -47,7 +47,7 @@ func TestNoNonRepeatableRead(t *testing.T) {
 
 func TestNoPhantom(t *testing.T) {
 	_, a, b := setupKV(t)
-	q(t, a, `BEGIN`)
+	q(t, a, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
 	expect(t, a, `SELECT count(*) FROM kv WHERE v > 5`, "2")
 	q(t, b, `INSERT INTO kv VALUES ('z', 30)`)
 	expect(t, a, `SELECT count(*) FROM kv WHERE v > 5`, "2")
@@ -57,8 +57,8 @@ func TestNoPhantom(t *testing.T) {
 
 func TestNoLostUpdate(t *testing.T) {
 	_, a, b := setupKV(t)
-	q(t, a, `BEGIN`)
-	q(t, b, `BEGIN`)
+	q(t, a, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
+	q(t, b, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
 	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "10")
 	expect(t, b, `SELECT v FROM kv WHERE k = 'x'`, "10")
 	q(t, a, `UPDATE kv SET v = v + 1 WHERE k = 'x'`)
@@ -103,9 +103,9 @@ func TestWaiterProceedsWhenHolderAborts(t *testing.T) {
 func TestNoReadSkew(t *testing.T) {
 	_, a, b := setupKV(t)
 	// Invariant x + y = 30. b moves 5 from y to x while a reads.
-	q(t, a, `BEGIN`)
+	q(t, a, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
 	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "10")
-	q(t, b, `BEGIN`)
+	q(t, b, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
 	q(t, b, `UPDATE kv SET v = v + 5 WHERE k = 'x'`)
 	q(t, b, `UPDATE kv SET v = v - 5 WHERE k = 'y'`)
 	q(t, b, `COMMIT`)
@@ -123,8 +123,8 @@ func TestWriteSkewIsPossible(t *testing.T) {
 	_ = db
 	q(t, a, `CREATE TABLE oncall (doctor text PRIMARY KEY, on_duty bool)`)
 	q(t, a, `INSERT INTO oncall VALUES ('alice', true), ('bob', true)`)
-	q(t, a, `BEGIN`)
-	q(t, b, `BEGIN`)
+	q(t, a, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
+	q(t, b, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
 	expect(t, a, `SELECT count(*) FROM oncall WHERE on_duty`, "2")
 	expect(t, b, `SELECT count(*) FROM oncall WHERE on_duty`, "2")
 	q(t, a, `UPDATE oncall SET on_duty = false WHERE doctor = 'alice'`)
@@ -275,4 +275,59 @@ func TestBankTransfers(t *testing.T) {
 	expect(t, setup, `SELECT sum(bal), min(bal) >= 0 FROM bank`, fmt.Sprintf("%d|t", accounts*initial))
 	t.Logf("%d transfers committed, %d retries after 40001/40P01, %d rejected by CHECK, %d consistent audits",
 		committed.Load(), retries.Load(), overdrawn.Load(), audits.Load())
+}
+
+func TestReadCommittedSeesCommittedChanges(t *testing.T) {
+	_, a, b := setupKV(t)
+	q(t, a, `BEGIN ISOLATION LEVEL READ COMMITTED`)
+	expect(t, a, `SHOW transaction_isolation`, "read committed")
+	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "10")
+	q(t, b, `UPDATE kv SET v = 11 WHERE k = 'x'`)
+	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "11") // a new snapshot per statement
+	q(t, a, `COMMIT`)
+}
+
+// TestReadCommittedNoLostUpdate: concurrent increments under READ
+// COMMITTED both succeed (the second is restarted on a new snapshot after
+// the first commits) and neither is lost.
+func TestReadCommittedNoLostUpdate(t *testing.T) {
+	_, a, b := setupKV(t)
+	q(t, a, `BEGIN`)
+	q(t, b, `BEGIN`)
+	q(t, a, `UPDATE kv SET v = v + 1 WHERE k = 'x'`)
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Exec(`UPDATE kv SET v = v + 1 WHERE k = 'x'`)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	q(t, a, `COMMIT`)
+	if err := <-done; err != nil {
+		t.Fatalf("READ COMMITTED update should be restarted, not fail: %v", err)
+	}
+	q(t, b, `COMMIT`)
+	expect(t, a, `SELECT v FROM kv WHERE k = 'x'`, "12")
+}
+
+// TestReadCommittedRechecksCondition: the restarted statement evaluates
+// its WHERE clause against the committed row.
+func TestReadCommittedRechecksCondition(t *testing.T) {
+	_, a, b := setupKV(t)
+	q(t, a, `BEGIN`)
+	q(t, a, `UPDATE kv SET v = 0 WHERE k = 'x'`)
+	done := make(chan string, 1)
+	go func() {
+		res, err := b.Exec(`UPDATE kv SET v = v + 100 WHERE v > 5`)
+		if err != nil {
+			done <- err.Error()
+			return
+		}
+		done <- res[0].Tag
+	}()
+	time.Sleep(50 * time.Millisecond)
+	q(t, a, `COMMIT`)
+	if tag := <-done; tag != "UPDATE 1" {
+		t.Fatalf("want only y updated (UPDATE 1), got %s", tag)
+	}
+	expect(t, a, `SELECT k, v FROM kv ORDER BY k`, "x|0\ny|120")
 }

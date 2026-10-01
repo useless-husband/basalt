@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sort"
@@ -92,8 +93,8 @@ var defaultSettings = map[string]string{
 	"integer_datetimes":                   "on",
 	"standard_conforming_strings":         "on",
 	"search_path":                         `"$user", public`,
-	"default_transaction_isolation":       "repeatable read",
-	"transaction_isolation":               "repeatable read",
+	"default_transaction_isolation":       "read committed",
+	"transaction_isolation":               "read committed",
 	"transaction_read_only":               "off",
 	"default_transaction_read_only":       "off",
 	"max_identifier_length":               "63",
@@ -194,6 +195,7 @@ func (s *Session) beginTxn() {
 	if s.txn == nil {
 		s.txn = s.db.txns.Begin()
 		s.txn.ReadOnly = s.readOnly
+		s.txn.ReadCommitted = isolationReadCommitted(s.settings["default_transaction_isolation"])
 		s.txnStart = nowMicros()
 	}
 }
@@ -432,6 +434,9 @@ func (s *Session) txnControl(t *sql.TransactionStmt) (*Result, error) {
 		}
 		s.readOnly = t.ReadOnly
 		s.beginTxn()
+		if t.Isolation != "" {
+			s.txn.ReadCommitted = isolationReadCommitted(t.Isolation)
+		}
 		s.explicit = true
 		return &Result{Tag: "BEGIN"}, nil
 	case sql.TxnCommit:
@@ -578,28 +583,47 @@ func (s *Session) execPlanned(ctx context.Context, st sql.Stmt, params []types.V
 			prep.planned = nil
 		}
 	}
-	s.txn.Snapshot()
 	cat := s.catalog()
 	ec := &expr.Ctx{Params: params, Env: s, Check: checkFn(ctx)}
-	xc := executor.New(s.txn, s.db.store, cat, ec)
-	xc.TableChanged = s.db.noteChange
-	defer xc.Close()
-	if ps.explain != nil {
-		return s.explain(ps, xc, ec)
-	}
-	if ps.kind == "SELECT" {
-		if err := s.checkReadOnly(ps); err != nil {
+	var xc *executor.Ctx
+	var rows []executor.Row
+	for attempt := 1; ; attempt++ {
+		s.txn.NewStatement()
+		s.txn.Snapshot()
+		ec.ResetCache()
+		xc = executor.New(s.txn, s.db.store, cat, ec)
+		xc.TableChanged = s.db.noteChange
+		if ps.explain != nil {
+			defer xc.Close()
+			return s.explain(ps, xc, ec)
+		}
+		it, err := xc.Build(ps.plan)
+		if err != nil {
+			xc.Close()
 			return nil, err
 		}
-	}
-	it, err := xc.Build(ps.plan)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := executor.Drain(it, ec)
-	s.txn.CommandCounterIncrement()
-	if err != nil {
-		return nil, err
+		rows, err = executor.Drain(it, ec)
+		xc.Close()
+		var restart *executor.RestartError
+		if errors.As(err, &restart) && attempt < maxStatementRestarts {
+			// READ COMMITTED: a row we wanted to change was changed by a
+			// transaction that committed after our snapshot. Undo this
+			// statement's changes and run it again on a new snapshot,
+			// which sees the committed change.
+			if uerr := xc.Undo(); uerr != nil {
+				return nil, uerr
+			}
+			s.txn.CommandCounterIncrement()
+			continue
+		}
+		s.txn.CommandCounterIncrement()
+		if restart != nil {
+			return nil, restart.Err
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 	res := &Result{HasRows: ps.hasRows}
 	for _, o := range ps.output {
@@ -619,7 +643,18 @@ func (s *Session) execPlanned(ctx context.Context, st sql.Stmt, params []types.V
 	return res, nil
 }
 
-func (s *Session) checkReadOnly(*plannedStmt) error { return nil }
+// maxStatementRestarts bounds READ COMMITTED restarts of one statement.
+const maxStatementRestarts = 100
+
+// isolationReadCommitted reports whether a level name selects READ
+// COMMITTED (as opposed to REPEATABLE READ / snapshot isolation).
+func isolationReadCommitted(level string) bool {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "read committed", "read uncommitted":
+		return true
+	}
+	return false
+}
 
 // convertRegs renders reg* values (stored as OIDs) as names.
 func (s *Session) convertRegs(cols []Column, rows [][]types.Value) [][]types.Value {
@@ -762,8 +797,18 @@ func (s *Session) ExecPrepared(p *Prepared, params []types.Value) (*Result, erro
 func (s *Session) set(x *sql.SetStmt) (*Result, error) {
 	name := strings.ToLower(x.Name)
 	if name == "transaction" || name == "transaction_isolation" {
-		if x.TxnIsolation == "serializable" {
-			return nil, pgerr.Unsupported("SERIALIZABLE isolation is not supported; basalt provides snapshot isolation (REPEATABLE READ)")
+		level := x.TxnIsolation
+		if level == "" {
+			level = strings.Trim(x.Value, "'")
+		}
+		if strings.EqualFold(level, "serializable") {
+			return nil, pgerr.Unsupported("SERIALIZABLE isolation is not supported; basalt provides READ COMMITTED and REPEATABLE READ (snapshot isolation)")
+		}
+		if s.txn != nil && level != "" {
+			if s.txn.Snap != nil {
+				return nil, pgerr.New(pgerr.ActiveSQLTransaction, "SET TRANSACTION ISOLATION LEVEL must be called before any query")
+			}
+			s.txn.ReadCommitted = isolationReadCommitted(level)
 		}
 		return &Result{Tag: "SET"}, nil
 	}
@@ -822,6 +867,15 @@ func (s *Session) show(x *sql.ShowStmt) (*Result, error) {
 		return res, nil
 	}
 	v, ok := s.settings[name]
+	if name == "transaction_isolation" {
+		v = s.settings["default_transaction_isolation"]
+		if s.txn != nil {
+			v = "repeatable read"
+			if s.txn.ReadCommitted {
+				v = "read committed"
+			}
+		}
+	}
 	if !ok {
 		return nil, pgerr.New(pgerr.UndefinedObject, "unrecognized configuration parameter \"%s\"", x.Name)
 	}

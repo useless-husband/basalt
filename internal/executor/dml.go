@@ -141,6 +141,7 @@ func (o *tableOps) insertTuple(vals Row, onConflict bool) (storage.TID, storage.
 	if err != nil {
 		return 0, 0, false, err
 	}
+	o.c.touched = append(o.c.touched, touch{heap: o.heap, tid: tid})
 	for _, ix := range o.indexes {
 		conflict, err := o.insertIndex(ix, vals, tid)
 		if err != nil {
@@ -249,6 +250,9 @@ func (o *tableOps) lockRow(tid storage.TID, update bool) (bool, error) {
 								what = "delete"
 							}
 							serr = pgerr.New(pgerr.SerializationFailure, "could not serialize access due to concurrent %s", what)
+							if o.c.Txn.ReadCommitted {
+								serr = &RestartError{Err: serr}
+							}
 							return serr
 						}
 					case txn.InProgress:
@@ -270,6 +274,8 @@ func (o *tableOps) lockRow(tid storage.TID, update bool) (bool, error) {
 			return false, nil
 		case serr != nil:
 			return false, serr
+		case err == nil:
+			o.c.touched = append(o.c.touched, touch{heap: o.heap, tid: tid, locked: true})
 		case errors.Is(err, errWait):
 			if err := o.c.Txn.WaitFor(wait); err != nil {
 				return false, err

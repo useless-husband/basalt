@@ -166,7 +166,11 @@ type Txn struct {
 	Snap     *Snapshot
 	Cid      uint32 // current command id
 	ReadOnly bool
-	done     bool
+	// ReadCommitted gives each statement a fresh snapshot (PostgreSQL's
+	// READ COMMITTED); otherwise the first statement's snapshot is kept
+	// for the whole transaction (REPEATABLE READ, snapshot isolation).
+	ReadCommitted bool
+	done          bool
 	// Ctx is the context of the current statement (cancellation).
 	Ctx context.Context
 }
@@ -236,6 +240,14 @@ func (t *Txn) AssignXid() (uint64, error) {
 		return 0, err
 	}
 	return xid, nil
+}
+
+// NewStatement prepares for the next statement: under READ COMMITTED it
+// drops the snapshot so the statement takes a new one.
+func (t *Txn) NewStatement() {
+	if t.ReadCommitted {
+		t.Snap = nil
+	}
 }
 
 // CommandCounterIncrement starts a new command: rows written by earlier

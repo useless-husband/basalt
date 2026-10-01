@@ -106,3 +106,7 @@ EXPLAIN (COSTS OFF) SELECT customer_id, sum(amount) FROM orders GROUP BY custome
 
 SHOW server_version;
 SHOW transaction_isolation;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+COMMIT;
+BEGIN ISOLATION LEVEL SERIALIZABLE;

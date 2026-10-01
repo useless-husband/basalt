@@ -135,6 +135,7 @@ class PsycopgTest(unittest.TestCase):
             setup.execute("CREATE TABLE si (id int PRIMARY KEY, v int)")
             setup.execute("INSERT INTO si VALUES (1, 1)")
         with self.connect() as a, self.connect() as b:
+            a.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             self.assertEqual(a.execute("SELECT v FROM si WHERE id = 1").fetchone()[0], 1)
             b.execute("UPDATE si SET v = 2 WHERE id = 1")
             b.commit()
