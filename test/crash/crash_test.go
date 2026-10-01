@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -33,7 +34,11 @@ type server struct {
 func buildServer(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "basalt")
-	cmd := exec.Command("go", "build", "-o", bin, "../../cmd/basalt")
+	args := []string{"build", "-o", bin}
+	if os.Getenv("BASALT_CRASH_RACE") != "" {
+		args = append(args, "-race") // the server reports data races on stderr
+	}
+	cmd := exec.Command("go", append(args, "../../cmd/basalt")...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
@@ -165,6 +170,9 @@ func TestCrashKill(t *testing.T) {
 		totalAcked = acked
 	}
 	srv.kill()
+	if b, err := os.ReadFile(logf.Name()); err == nil && strings.Contains(string(b), "DATA RACE") {
+		t.Fatalf("the server reported a data race:\n%s", b)
+	}
 	if totalAcked == 0 {
 		t.Fatal("no transaction was ever acknowledged; the workload did not run")
 	}
