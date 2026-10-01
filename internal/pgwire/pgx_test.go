@@ -86,20 +86,20 @@ func TestPgxTypesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var (
-		b    bool
-		i2   int16
-		i4   int32
-		i8   int64
-		f4   float32
-		f8   float64
-		n    pgtype.Numeric
-		s    string
-		vc   string
-		d    time.Time
-		gts  time.Time
-		gtz  time.Time
-		by   []byte
-		iv   pgtype.Interval
+		b   bool
+		i2  int16
+		i4  int32
+		i8  int64
+		f4  float32
+		f8  float64
+		n   pgtype.Numeric
+		s   string
+		vc  string
+		d   time.Time
+		gts time.Time
+		gtz time.Time
+		by  []byte
+		iv  pgtype.Interval
 	)
 	err = c.QueryRow(ctx, `SELECT b, i2, i4, i8, f4, f8, n, t, vc, d, ts, tz, by, iv FROM all_types WHERE id = $1`, id).
 		Scan(&b, &i2, &i4, &i8, &f4, &f8, &n, &s, &vc, &d, &gts, &gtz, &by, &iv)
