@@ -15,7 +15,7 @@ func (s *Session) CopyTarget(cp *sql.CopyStmt) (*catalog.Table, []int, error) {
 	if s.failed {
 		return nil, nil, pgerr.New(pgerr.InFailedSQLTransaction, "current transaction is aborted, commands ignored until end of transaction block")
 	}
-	t := s.db.Catalog().TableByName(cp.Table.Name)
+	t := s.catalog().TableByName(cp.Table.Name)
 	if t == nil {
 		return nil, nil, pgerr.New(pgerr.UndefinedTable, "relation \"%s\" does not exist", cp.Table.Name)
 	}

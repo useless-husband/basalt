@@ -18,40 +18,63 @@ import (
 
 // ddl runs a schema change. DDL is not transactional in basalt: each
 // statement commits on its own (it is rejected inside BEGIN ... COMMIT).
+// ddl runs a schema change inside the session's transaction. The changes
+// go to a transaction-private copy of the catalog that is published,
+// atomically with the commit record, when the transaction commits; a
+// rollback discards it and frees any storage the DDL allocated.
 func (s *Session) ddl(ctx context.Context, st sql.Stmt) (*Result, error) {
-	// A transaction to hold locks and read existing rows.
-	t := s.db.txns.Begin()
-	t.Ctx = ctx
-	defer func() {
-		if !t.Done() {
-			t.Abort()
-		}
-	}()
-	var res *Result
-	var err error
+	s.beginTxn()
+	s.txn.Ctx = ctx
+	t := s.txn
 	switch x := st.(type) {
 	case *sql.CreateTableStmt:
-		res, err = s.createTable(t, x)
+		return s.createTable(t, x)
 	case *sql.CreateIndexStmt:
-		res, err = s.createIndex(t, x)
+		return s.createIndex(t, x)
 	case *sql.DropStmt:
-		res, err = s.drop(t, x)
+		return s.drop(t, x)
 	case *sql.AlterTableStmt:
-		res, err = s.alterTable(t, x)
+		return s.alterTable(t, x)
 	case *sql.TruncateStmt:
-		res, err = s.truncate(t, x)
+		return s.truncate(t, x)
 	case *sql.CreateSequenceStmt:
-		res, err = s.createSequence(t, x)
-	default:
-		err = pgerr.Internal("unknown DDL %T", st)
+		return s.createSequence(t, x)
 	}
-	if err != nil {
+	return nil, pgerr.Internal("unknown DDL %T", st)
+}
+
+// catalogTag is the lock that serializes catalog changes. It lives in the
+// lock manager (not a mutex) so that waits for it take part in deadlock
+// detection; it is held until the end of the changing transaction.
+var catalogTag = txn.Tag{Kind: txn.TagRelation, ID: 0}
+
+// lockCatalog takes the catalog lock and starts the transaction-private
+// catalog if needed. It returns a copy to modify.
+func (s *Session) lockCatalog() (*catalog.Catalog, error) {
+	if err := s.txn.Lock(catalogTag, txn.Exclusive); err != nil {
 		return nil, err
 	}
-	if err := t.Commit(); err != nil {
-		return nil, err
+	if s.txnCat == nil {
+		s.txnCat = s.db.Catalog()
 	}
-	return res, nil
+	return s.txnCat.Clone(), nil
+}
+
+// stageCatalog makes cat the transaction's catalog. m, if not nil, holds
+// storage allocations for the change and is committed first; undo frees
+// that storage if the transaction rolls back.
+func (s *Session) stageCatalog(m *storage.Mtr, cat *catalog.Catalog, undo func()) error {
+	if m != nil {
+		if _, err := m.Commit(); err != nil {
+			return err
+		}
+	}
+	cat.Version = s.db.nextCatalogVersion()
+	s.txnCat = cat
+	if undo != nil {
+		s.undo = append(s.undo, undo)
+	}
+	return nil
 }
 
 func relationExists(cat *catalog.Catalog, name string) bool {
@@ -96,9 +119,10 @@ func (s *Session) createTable(t *txn.Txn, x *sql.CreateTableStmt) (*Result, erro
 	if x.AsSelect != nil {
 		return s.createTableAs(t, x)
 	}
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cur := db.Catalog()
+	cur, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
 	name := x.Table.Name
 	if relationExists(cur, name) {
 		if x.IfNotExists {
@@ -113,7 +137,7 @@ func (s *Session) createTable(t *txn.Txn, x *sql.CreateTableStmt) (*Result, erro
 	if len(x.Columns) > 1600 {
 		return nil, pgerr.New(pgerr.ProgramLimitExceeded, "tables can have at most 1600 columns")
 	}
-	cat := cur.Clone()
+	cat := cur
 	tbl := &catalog.Table{Name: name}
 	taken := map[string]bool{name: true}
 	var seqs []*catalog.Sequence
@@ -192,10 +216,9 @@ func (s *Session) createTable(t *txn.Txn, x *sql.CreateTableStmt) (*Result, erro
 			return nil, err
 		}
 	}
-	// Allocate storage and object ids in the same mini-transaction that
-	// writes the catalog, so the table appears atomically.
+	// Allocate storage and object ids. The catalog entry that makes them
+	// reachable is written at commit; a rollback frees them.
 	m := db.store.Begin()
-	var err error
 	if tbl.Oid, err = m.NextOid(); err != nil {
 		m.Abort()
 		return nil, err
@@ -236,7 +259,14 @@ func (s *Session) createTable(t *txn.Txn, x *sql.CreateTableStmt) (*Result, erro
 		}
 	}
 	cat.Tables[tbl.Oid] = tbl
-	if err := db.saveCatalog(m, cat); err != nil {
+	undo := func() {
+		_ = db.store.FreeHeap(tbl.Heap)
+		for _, oid := range tbl.Indexes {
+			_ = db.store.FreeBTree(cat.Indexes[oid].Root)
+		}
+		db.freePages(seqPages(seqs))
+	}
+	if err := s.stageCatalog(m, cat, undo); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: "CREATE TABLE"}, nil
@@ -482,9 +512,10 @@ func modsOf(t types.T) []int {
 
 func (s *Session) createSequence(t *txn.Txn, x *sql.CreateSequenceStmt) (*Result, error) {
 	db := s.db
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cat := db.Catalog().Clone()
+	cat, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
 	if relationExists(cat, x.Name.Name) {
 		if x.IfNotExists {
 			return &Result{Tag: "CREATE SEQUENCE"}, nil
@@ -496,7 +527,6 @@ func (s *Session) createSequence(t *txn.Txn, x *sql.CreateSequenceStmt) (*Result
 	}
 	sq := &catalog.Sequence{Name: x.Name.Name, Increment: x.Increment, Start: x.Start}
 	m := db.store.Begin()
-	var err error
 	if sq.Oid, err = m.NextOid(); err != nil {
 		m.Abort()
 		return nil, err
@@ -506,7 +536,7 @@ func (s *Session) createSequence(t *txn.Txn, x *sql.CreateSequenceStmt) (*Result
 		return nil, err
 	}
 	cat.Sequences[sq.Oid] = sq
-	if err := db.saveCatalog(m, cat); err != nil {
+	if err := s.stageCatalog(m, cat, func() { db.freePages(seqPages([]*catalog.Sequence{sq})) }); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: "CREATE SEQUENCE"}, nil
@@ -516,14 +546,14 @@ func (s *Session) createSequence(t *txn.Txn, x *sql.CreateSequenceStmt) (*Result
 // version that might still be visible to some snapshot gets an entry;
 // uniqueness is enforced among the live versions only.
 func (s *Session) buildIndex(t *txn.Txn, tbl *catalog.Table, ix *catalog.Index) error {
-	cat := s.db.Catalog()
+	cat := s.catalog()
 	xc := executor.New(t, s.db.store, cat, &expr.Ctx{Env: s})
 	return xc.BuildIndex(tbl, ix)
 }
 
 func (s *Session) createIndex(t *txn.Txn, x *sql.CreateIndexStmt) (*Result, error) {
 	db := s.db
-	cur := db.Catalog()
+	cur := s.catalog()
 	tbl := cur.TableByName(x.Table.Name)
 	if tbl == nil {
 		return nil, pgerr.New(pgerr.UndefinedTable, "relation \"%s\" does not exist", x.Table.Name)
@@ -535,9 +565,10 @@ func (s *Session) createIndex(t *txn.Txn, x *sql.CreateIndexStmt) (*Result, erro
 	if err := lockTable(t, tbl.Oid, txn.Share); err != nil {
 		return nil, err
 	}
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cat := db.Catalog().Clone()
+	cat, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
 	tbl = cat.TableByName(x.Table.Name)
 	if tbl == nil {
 		return nil, pgerr.New(pgerr.UndefinedTable, "relation \"%s\" does not exist", x.Table.Name)
@@ -572,7 +603,6 @@ func (s *Session) createIndex(t *txn.Txn, x *sql.CreateIndexStmt) (*Result, erro
 	}
 	ix := &catalog.Index{Name: name, Table: tbl.Oid, Columns: cols, Unique: x.Unique}
 	m := db.store.Begin()
-	var err error
 	if ix.Oid, err = m.NextOid(); err != nil {
 		m.Abort()
 		return nil, err
@@ -581,11 +611,7 @@ func (s *Session) createIndex(t *txn.Txn, x *sql.CreateIndexStmt) (*Result, erro
 		m.Abort()
 		return nil, err
 	}
-	lsn, err := m.Commit()
-	if err != nil {
-		return nil, err
-	}
-	if err := db.store.Flush(lsn); err != nil {
+	if _, err := m.Commit(); err != nil {
 		return nil, err
 	}
 	if err := s.buildIndex(t, tbl, ix); err != nil {
@@ -594,7 +620,7 @@ func (s *Session) createIndex(t *txn.Txn, x *sql.CreateIndexStmt) (*Result, erro
 	}
 	cat.Indexes[ix.Oid] = ix
 	tbl.Indexes = append(tbl.Indexes, ix.Oid)
-	if err := db.saveCatalog(db.store.Begin(), cat); err != nil {
+	if err := s.stageCatalog(nil, cat, func() { _ = db.store.FreeBTree(ix.Root) }); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: "CREATE INDEX"}, nil
@@ -607,7 +633,7 @@ func (s *Session) drop(t *txn.Txn, x *sql.DropStmt) (*Result, error) {
 		return nil, pgerr.Unsupported("views are not supported")
 	}
 	// Lock the tables first (waiting for their users to finish).
-	cur := db.Catalog()
+	cur := s.catalog()
 	for _, n := range x.Names {
 		switch x.Kind {
 		case sql.DropTable:
@@ -624,9 +650,10 @@ func (s *Session) drop(t *txn.Txn, x *sql.DropStmt) (*Result, error) {
 			}
 		}
 	}
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cat := db.Catalog().Clone()
+	cat, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
 	var freeHeaps, freeTrees, freeSeqs []storage.PageID
 	for _, n := range x.Names {
 		switch x.Kind {
@@ -716,38 +743,26 @@ func (s *Session) drop(t *txn.Txn, x *sql.DropStmt) (*Result, error) {
 			delete(cat.Sequences, sq.Oid)
 		}
 	}
-	if err := db.saveCatalog(db.store.Begin(), cat); err != nil {
+	if err := s.stageCatalog(nil, cat, nil); err != nil {
 		return nil, err
 	}
-	// Free the storage after the catalog no longer references it.
-	for _, h := range freeHeaps {
-		if err := db.store.FreeHeap(h); err != nil {
-			return nil, err
+	// Free the storage once the commit has made the catalog stop
+	// referencing it.
+	s.afterCommit = append(s.afterCommit, func() {
+		for _, h := range freeHeaps {
+			_ = db.store.FreeHeap(h)
 		}
-	}
-	for _, r := range freeTrees {
-		if err := db.store.FreeBTree(r); err != nil {
-			return nil, err
+		for _, r := range freeTrees {
+			_ = db.store.FreeBTree(r)
 		}
-	}
-	if len(freeSeqs) > 0 {
-		m := db.store.Begin()
-		for _, p := range freeSeqs {
-			if err := m.Free(p); err != nil {
-				m.Abort()
-				return nil, err
-			}
-		}
-		if _, err := m.Commit(); err != nil {
-			return nil, err
-		}
-	}
+		db.freePages(freeSeqs)
+	})
 	return &Result{Tag: tag}, nil
 }
 
 func (s *Session) truncate(t *txn.Txn, x *sql.TruncateStmt) (*Result, error) {
 	db := s.db
-	cur := db.Catalog()
+	cur := s.catalog()
 	for _, n := range x.Tables {
 		tbl := cur.TableByName(n.Name)
 		if tbl == nil {
@@ -763,15 +778,15 @@ func (s *Session) truncate(t *txn.Txn, x *sql.TruncateStmt) (*Result, error) {
 			return nil, err
 		}
 	}
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cat := db.Catalog().Clone()
-	var oldHeaps, oldTrees []storage.PageID
+	cat, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
+	var oldHeaps, oldTrees, newHeaps, newTrees []storage.PageID
 	m := db.store.Begin()
 	for _, n := range x.Tables {
 		tbl := cat.TableByName(n.Name)
 		oldHeaps = append(oldHeaps, tbl.Heap)
-		var err error
 		if tbl.Heap, err = m.CreateHeap(); err != nil {
 			m.Abort()
 			return nil, err
@@ -783,28 +798,31 @@ func (s *Session) truncate(t *txn.Txn, x *sql.TruncateStmt) (*Result, error) {
 				m.Abort()
 				return nil, err
 			}
+			newTrees = append(newTrees, ix.Root)
 		}
+		newHeaps = append(newHeaps, tbl.Heap)
 		tbl.Stats = nil
 	}
-	if err := db.saveCatalog(m, cat); err != nil {
+	free := func(heaps, trees []storage.PageID) func() {
+		return func() {
+			for _, h := range heaps {
+				_ = db.store.FreeHeap(h)
+			}
+			for _, r := range trees {
+				_ = db.store.FreeBTree(r)
+			}
+		}
+	}
+	if err := s.stageCatalog(m, cat, free(newHeaps, newTrees)); err != nil {
 		return nil, err
 	}
-	for _, h := range oldHeaps {
-		if err := db.store.FreeHeap(h); err != nil {
-			return nil, err
-		}
-	}
-	for _, r := range oldTrees {
-		if err := db.store.FreeBTree(r); err != nil {
-			return nil, err
-		}
-	}
+	s.afterCommit = append(s.afterCommit, free(oldHeaps, oldTrees))
 	return &Result{Tag: "TRUNCATE TABLE"}, nil
 }
 
 func (s *Session) alterTable(t *txn.Txn, x *sql.AlterTableStmt) (*Result, error) {
 	db := s.db
-	cur := db.Catalog()
+	cur := s.catalog()
 	tbl := cur.TableByName(x.Table.Name)
 	if tbl == nil {
 		if x.IfExists {
@@ -815,9 +833,10 @@ func (s *Session) alterTable(t *txn.Txn, x *sql.AlterTableStmt) (*Result, error)
 	if err := lockTable(t, tbl.Oid, txn.AccessExclusive); err != nil {
 		return nil, err
 	}
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cat := db.Catalog().Clone()
+	cat, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
 	tbl = cat.Tables[tbl.Oid]
 	switch {
 	case x.RenameTo != "":
@@ -910,7 +929,6 @@ func (s *Session) alterTable(t *txn.Txn, x *sql.AlterTableStmt) (*Result, error)
 			pi := pend[0]
 			ix := &catalog.Index{Name: pi.name, Table: tbl.Oid, Columns: pi.cols, Unique: true, Primary: pi.primary, Constraint: true}
 			m := db.store.Begin()
-			var err error
 			if ix.Oid, err = m.NextOid(); err != nil {
 				m.Abort()
 				return nil, err
@@ -934,9 +952,10 @@ func (s *Session) alterTable(t *txn.Txn, x *sql.AlterTableStmt) (*Result, error)
 			}
 			cat.Indexes[ix.Oid] = ix
 			tbl.Indexes = append(tbl.Indexes, ix.Oid)
+			s.undo = append(s.undo, func() { _ = db.store.FreeBTree(ix.Root) })
 		}
 	}
-	if err := db.saveCatalog(db.store.Begin(), cat); err != nil {
+	if err := s.stageCatalog(nil, cat, nil); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: "ALTER TABLE"}, nil

@@ -41,7 +41,7 @@ type DB struct {
 	store  *storage.Store
 	txns   *txn.Manager
 	cat    atomic.Pointer[catalog.Catalog]
-	ddlMu  sync.Mutex
+	catVersion atomic.Uint64
 	seqMu  sync.Mutex
 	seqs   map[uint32]*seqState
 	vacMu  sync.Mutex
@@ -103,6 +103,7 @@ func Open(opts Options) (*DB, error) {
 			return nil, fmt.Errorf("decoding catalog: %w", err)
 		}
 	}
+	db.catVersion.Store(cat.Version)
 	db.cat.Store(cat)
 	if opts.AutovacuumInterval > 0 {
 		db.wg.Add(1)
@@ -145,53 +146,62 @@ func (db *DB) heapPages(t *catalog.Table) int {
 	return db.store.Heap(t.Heap).PageCount()
 }
 
-// saveCatalog writes cat inside the mini-transaction m (which may also
-// carry the storage changes of the DDL) and publishes it after commit.
-// The caller holds ddlMu.
-func (db *DB) saveCatalog(m *storage.Mtr, cat *catalog.Catalog) error {
-	cat.Version = db.Catalog().Version + 1
+// writeCatalog stores cat in the mini-transaction m (the commit of the
+// transaction that changed it) and frees the previous version's pages.
+func (db *DB) writeCatalog(m *storage.Mtr, cat *catalog.Catalog) error {
 	b, err := cat.Encode()
 	if err != nil {
-		m.Abort()
 		return err
 	}
 	old, err := m.CatalogRoot()
 	if err != nil {
-		m.Abort()
 		return err
 	}
 	root, err := m.WriteBlob(b)
 	if err != nil {
-		m.Abort()
 		return err
 	}
 	if err := m.SetCatalogRoot(root); err != nil {
-		m.Abort()
 		return err
 	}
 	if old != storage.InvalidPage {
-		if err := m.FreeBlob(old); err != nil {
+		return m.FreeBlob(old)
+	}
+	return nil
+}
+
+// nextCatalogVersion returns a version number never used before, so that
+// cached plans built against an abandoned catalog are never reused.
+func (db *DB) nextCatalogVersion() uint64 { return db.catVersion.Add(1) }
+
+// freePages frees standalone pages (sequence pages) in one mini-transaction.
+func (db *DB) freePages(pages []storage.PageID) {
+	if len(pages) == 0 {
+		return
+	}
+	m := db.store.Begin()
+	for _, p := range pages {
+		if err := m.Free(p); err != nil {
 			m.Abort()
-			return err
+			return
 		}
 	}
-	lsn, err := m.Commit()
-	if err != nil {
-		return err
+	_, _ = m.Commit()
+}
+
+func seqPages(seqs []*catalog.Sequence) []storage.PageID {
+	var out []storage.PageID
+	for _, s := range seqs {
+		out = append(out, s.Page)
 	}
-	if err := db.store.Flush(lsn); err != nil {
-		return err
-	}
-	db.cat.Store(cat)
-	return nil
+	return out
 }
 
 // ---- sequences ----
 
 const seqCache = 32
 
-func (db *DB) sequence(name string) (*catalog.Sequence, *seqState, error) {
-	cat := db.Catalog()
+func (db *DB) sequence(cat *catalog.Catalog, name string) (*catalog.Sequence, *seqState, error) {
 	s := cat.SequenceByName(name)
 	if s == nil {
 		return nil, nil, pgerr.New(pgerr.UndefinedTable, "relation \"%s\" does not exist", name)
@@ -222,8 +232,8 @@ func (db *DB) sequence(name string) (*catalog.Sequence, *seqState, error) {
 // logged (not flushed): a crash may skip values but never repeats one that
 // a committed transaction used, because its commit flushed the log past
 // the reservation.
-func (db *DB) Nextval(name string) (int64, error) {
-	s, st, err := db.sequence(name)
+func (db *DB) Nextval(cat *catalog.Catalog, name string) (int64, error) {
+	s, st, err := db.sequence(cat, name)
 	if err != nil {
 		return 0, err
 	}
@@ -248,8 +258,8 @@ func (db *DB) Nextval(name string) (int64, error) {
 }
 
 // Setval sets a sequence's next value.
-func (db *DB) Setval(name string, v int64, isCalled bool) (int64, error) {
-	s, st, err := db.sequence(name)
+func (db *DB) Setval(cat *catalog.Catalog, name string, v int64, isCalled bool) (int64, error) {
+	s, st, err := db.sequence(cat, name)
 	if err != nil {
 		return 0, err
 	}

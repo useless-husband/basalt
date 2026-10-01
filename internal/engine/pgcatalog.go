@@ -82,7 +82,7 @@ func relInfo(cat *catalog.Catalog, oid uint32) (name string, kind byte, ok bool)
 
 // virtualTable resolves pg_catalog and information_schema tables.
 func (s *Session) virtualTable(schema, name string) (*planner.VirtualTable, bool) {
-	cat := s.db.Catalog()
+	cat := s.catalog()
 	mk := func(columns []vcol, rows func() [][]types.Value) (*planner.VirtualTable, bool) {
 		return &planner.VirtualTable{Name: name, Columns: columns, Rows: func() ([][]types.Value, error) { return rows(), nil }}, true
 	}
@@ -562,7 +562,7 @@ func (s *Session) infoSchema(cat *catalog.Catalog, name string) (*planner.Virtua
 
 // CatalogFunc implements the pg_* functions and catalog-aware casts.
 func (s *Session) CatalogFunc(name string, a []types.Value) (types.Value, error) {
-	cat := s.db.Catalog()
+	cat := s.catalog()
 	argNull := func(i int) bool { return i >= len(a) || a[i].IsNull() }
 	switch name {
 	case "cast":

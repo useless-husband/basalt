@@ -136,3 +136,50 @@ func TestTransactionsAndRecovery(t *testing.T) {
 }
 
 func nil2rand() *rand.Rand { return rand.New(rand.NewSource(1)) }
+
+func TestTransactionalDDL(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("test", "test")
+	other := db.NewSession("test", "test")
+	pagesBefore := db.Store().PageCount()
+
+	// Rolled-back CREATE TABLE leaves nothing behind.
+	q(t, s, `BEGIN`)
+	q(t, s, `CREATE TABLE t (id int PRIMARY KEY, v text UNIQUE)`)
+	q(t, s, `INSERT INTO t VALUES (1, 'a')`)
+	expect(t, s, `SELECT count(*) FROM t`, "1")
+	qerr(t, other, `SELECT * FROM t`, pgerr.UndefinedTable) // not visible before commit
+	q(t, s, `ROLLBACK`)
+	qerr(t, s, `SELECT * FROM t`, pgerr.UndefinedTable)
+	free, err := db.Store().FreePages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grown := int(db.Store().PageCount()-pagesBefore) - free; grown > 2 {
+		t.Fatalf("rollback leaked %d pages", grown)
+	}
+
+	// Committed DDL and data appear together.
+	q(t, s, `BEGIN`)
+	q(t, s, `CREATE TABLE t (id serial PRIMARY KEY, v text)`)
+	q(t, s, `INSERT INTO t (v) VALUES ('x'), ('y')`)
+	q(t, s, `CREATE INDEX t_v ON t (v)`)
+	q(t, s, `COMMIT`)
+	expect(t, other, `SELECT id, v FROM t ORDER BY id`, "1|x\n2|y")
+
+	// DROP and TRUNCATE inside a rolled-back transaction keep the data.
+	q(t, s, `BEGIN`)
+	q(t, s, `TRUNCATE t`)
+	expect(t, s, `SELECT count(*) FROM t`, "0")
+	q(t, s, `DROP TABLE t`)
+	q(t, s, `ROLLBACK`)
+	expect(t, other, `SELECT count(*) FROM t WHERE v = 'y'`, "1")
+
+	// A failed statement inside the block rolls back the DDL with it.
+	q(t, s, `BEGIN`)
+	q(t, s, `ALTER TABLE t ADD COLUMN extra int DEFAULT 7`)
+	qerr(t, s, `SELECT nosuch FROM t`, pgerr.UndefinedColumn)
+	q(t, s, `COMMIT`)
+	qerr(t, other, `SELECT extra FROM t`, pgerr.UndefinedColumn)
+}

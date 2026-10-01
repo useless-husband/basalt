@@ -82,11 +82,25 @@ func (s *Store) clogPage(xid uint64) (PageID, error) {
 // the change; a committer must flush the WAL up to it before reporting
 // success.
 func (s *Store) SetXidStatus(xid uint64, status byte) (LSN, error) {
+	return s.SetXidStatusWith(xid, status, nil)
+}
+
+// SetXidStatusWith records a status like SetXidStatus, and applies more
+// page changes (with) in the same mini-transaction, so that both reach the
+// log as one atomic record. Transactional DDL uses it to publish the new
+// catalog together with the commit.
+func (s *Store) SetXidStatusWith(xid uint64, status byte, with func(m *Mtr) error) (LSN, error) {
 	id, err := s.clogPage(xid)
 	if err != nil {
 		return 0, err
 	}
 	m := s.Begin()
+	if with != nil {
+		if err := with(m); err != nil {
+			m.Abort()
+			return 0, err
+		}
+	}
 	p, err := m.Page(id)
 	if err != nil {
 		m.Abort()

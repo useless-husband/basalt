@@ -19,7 +19,7 @@ import (
 )
 
 func (s *Session) tablesFor(name *sql.TableName) ([]*catalog.Table, error) {
-	cat := s.db.Catalog()
+	cat := s.catalog()
 	if name == nil {
 		return cat.SortedTables(), nil
 	}
@@ -95,22 +95,22 @@ const (
 func (s *Session) analyzeTables(ctx context.Context, tables []*catalog.Table) (*Result, error) {
 	stats := map[uint32]*catalog.TableStats{}
 	for _, t := range tables {
-		st, err := s.db.gatherStats(ctx, t)
+		st, err := s.db.gatherStats(ctx, s.txn, t)
 		if err != nil {
 			return nil, err
 		}
 		stats[t.Oid] = st
 	}
-	db := s.db
-	db.ddlMu.Lock()
-	defer db.ddlMu.Unlock()
-	cat := db.Catalog().Clone()
+	cat, err := s.lockCatalog()
+	if err != nil {
+		return nil, err
+	}
 	for oid, st := range stats {
 		if t := cat.Tables[oid]; t != nil {
 			t.Stats = st
 		}
 	}
-	// Decode parsed forms of the new statistics.
+	// Re-decode to fill in the parsed forms of the new statistics.
 	b, err := cat.Encode()
 	if err != nil {
 		return nil, err
@@ -118,18 +118,15 @@ func (s *Session) analyzeTables(ctx context.Context, tables []*catalog.Table) (*
 	if cat, err = catalog.Decode(b); err != nil {
 		return nil, err
 	}
-	if err := db.saveCatalog(db.store.Begin(), cat); err != nil {
+	if err := s.stageCatalog(nil, cat, nil); err != nil {
 		return nil, err
 	}
 	return &Result{Tag: "ANALYZE"}, nil
 }
 
-// gatherStats reads a table (with a fresh snapshot) and computes planner
-// statistics from a reservoir sample of its live rows.
-func (db *DB) gatherStats(ctx context.Context, t *catalog.Table) (*catalog.TableStats, error) {
-	tx := db.txns.Begin()
-	tx.Ctx = ctx
-	defer tx.Abort()
+// gatherStats reads a table with the snapshot of transaction tx and
+// computes planner statistics from a reservoir sample of its live rows.
+func (db *DB) gatherStats(ctx context.Context, tx *txn.Txn, t *catalog.Table) (*catalog.TableStats, error) {
 	if err := tx.Lock(txn.Tag{Kind: txn.TagRelation, ID: uint64(t.Oid)}, txn.AccessShare); err != nil {
 		return nil, err
 	}

@@ -246,14 +246,26 @@ func (t *Txn) CommandCounterIncrement() { t.Cid++ }
 func (t *Txn) Done() bool { return t.done }
 
 // Commit makes the transaction's writes durable and visible.
-func (t *Txn) Commit() error {
+func (t *Txn) Commit() error { return t.CommitWith(nil, nil) }
+
+// CommitWith commits like Commit. with, if set, adds page changes to the
+// commit's mini-transaction (they become durable atomically with the
+// commit); onDurable runs after the commit is durable and before the
+// transaction's locks are released.
+func (t *Txn) CommitWith(with func(m *storage.Mtr) error, onDurable func()) error {
 	if t.done {
 		return nil
+	}
+	if with != nil && t.Xid == 0 {
+		if _, err := t.AssignXid(); err != nil {
+			t.Abort()
+			return err
+		}
 	}
 	t.done = true
 	m := t.m
 	if t.Xid != 0 {
-		lsn, err := m.store.SetXidStatus(t.Xid, Committed)
+		lsn, err := m.store.SetXidStatusWith(t.Xid, Committed, with)
 		if err == nil {
 			err = m.store.Flush(lsn)
 		}
@@ -264,6 +276,9 @@ func (t *Txn) Commit() error {
 		}
 		m.clog.set(t.Xid, Committed)
 		m.Commits.Add(1)
+	}
+	if onDurable != nil {
+		onDurable()
 	}
 	m.finish(t)
 	return nil

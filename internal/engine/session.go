@@ -16,6 +16,7 @@ import (
 	"github.com/useless-husband/basalt/internal/pgerr"
 	"github.com/useless-husband/basalt/internal/planner"
 	"github.com/useless-husband/basalt/internal/sql"
+	"github.com/useless-husband/basalt/internal/storage"
 	"github.com/useless-husband/basalt/internal/txn"
 	"github.com/useless-husband/basalt/internal/types"
 )
@@ -65,6 +66,13 @@ type Session struct {
 	settings map[string]string
 	prepared map[string]*Prepared
 	currval  map[string]int64
+
+	// Transactional DDL: the transaction's private catalog (nil if the
+	// transaction changed no schema), storage to free on rollback, and
+	// storage to free after commit.
+	txnCat      *catalog.Catalog
+	undo        []func()
+	afterCommit []func()
 
 	cancelMu   sync.Mutex
 	curCancel  context.CancelCauseFunc
@@ -190,17 +198,47 @@ func (s *Session) beginTxn() {
 	}
 }
 
+// catalog returns the catalog this session sees: its transaction's private
+// version after DDL, the published one otherwise.
+func (s *Session) catalog() *catalog.Catalog {
+	if s.txnCat != nil {
+		return s.txnCat
+	}
+	return s.db.Catalog()
+}
+
 func (s *Session) endTxn(commit bool) error {
 	t := s.txn
 	s.txn = nil
 	s.readOnly = false
+	cat, undo, after := s.txnCat, s.undo, s.afterCommit
+	s.txnCat, s.undo, s.afterCommit = nil, nil, nil
 	if t == nil {
 		return nil
 	}
-	if commit {
+	if !commit {
+		t.Abort()
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+		return nil
+	}
+	if cat == nil {
 		return t.Commit()
 	}
-	t.Abort()
+	// The new catalog is written in the commit's own mini-transaction and
+	// published before the transaction's locks are released.
+	err := t.CommitWith(func(m *storage.Mtr) error { return s.db.writeCatalog(m, cat) },
+		func() { s.db.cat.Store(cat) })
+	if err != nil {
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+		return err
+	}
+	for _, f := range after {
+		f()
+	}
 	return nil
 }
 
@@ -295,9 +333,11 @@ func (s *Session) Exec(query string) ([]*Result, error) {
 func (s *Session) failTxn() {
 	if s.explicit {
 		s.failed = true
-		if s.txn != nil {
-			s.txn.Abort() // release locks now; the block stays failed
-		}
+		// Roll back now (releasing locks); the block stays failed until
+		// the client ends it.
+		readOnly := s.readOnly
+		_ = s.endTxn(false)
+		s.readOnly = readOnly
 		return
 	}
 	_ = s.endTxn(false)
@@ -381,16 +421,6 @@ func (s *Session) run(st sql.Stmt, params []types.Value, prep *Prepared, inBatch
 		return s.vacuum(ctx, x)
 	}
 	if isDDL(st) {
-		if s.explicit {
-			return nil, pgerr.New(pgerr.ActiveSQLTransaction, "%s cannot run inside a transaction block", stmtName(st)).
-				WithHint("basalt does not support transactional DDL; run DDL outside BEGIN ... COMMIT.")
-		}
-		if s.txn != nil {
-			// Inside a multi-statement batch: commit what came before.
-			if err := s.endTxn(true); err != nil {
-				return nil, err
-			}
-		}
 		return s.ddl(ctx, st)
 	}
 	s.beginTxn()
@@ -472,7 +502,7 @@ func (s *Session) setting(name string) string { return s.settings[name] }
 
 // plan binds and plans a statement against the current catalog.
 func (s *Session) plan(st sql.Stmt, paramTypes []types.T) (*plannedStmt, []types.T, error) {
-	cat := s.db.Catalog()
+	cat := s.catalog()
 	ps := &plannedStmt{catVersion: cat.Version}
 	if ex, ok := st.(*sql.ExplainStmt); ok {
 		ps.explain = ex
@@ -537,7 +567,7 @@ func (s *Session) execPlanned(ctx context.Context, st sql.Stmt, params []types.V
 	var ps *plannedStmt
 	var err error
 	for attempt := 0; ; attempt++ {
-		if prep != nil && prep.planned != nil && prep.planned.catVersion == s.db.Catalog().Version {
+		if prep != nil && prep.planned != nil && prep.planned.catVersion == s.catalog().Version {
 			ps = prep.planned
 		} else {
 			var ptypes []types.T
@@ -561,7 +591,7 @@ func (s *Session) execPlanned(ctx context.Context, st sql.Stmt, params []types.V
 				return nil, err
 			}
 		}
-		if ps.catVersion == s.db.Catalog().Version || attempt >= 3 {
+		if ps.catVersion == s.catalog().Version || attempt >= 3 {
 			break
 		}
 		if prep != nil {
@@ -569,7 +599,7 @@ func (s *Session) execPlanned(ctx context.Context, st sql.Stmt, params []types.V
 		}
 	}
 	s.txn.Snapshot()
-	cat := s.db.Catalog()
+	cat := s.catalog()
 	ec := &expr.Ctx{Params: params, Env: s, Check: checkFn(ctx)}
 	xc := executor.New(s.txn, s.db.store, cat, ec)
 	xc.TableChanged = s.db.noteChange
@@ -842,7 +872,7 @@ func (s *Session) BackendPID() int64 { return s.pid }
 
 // Nextval implements expr.Env.
 func (s *Session) Nextval(seq string) (int64, error) {
-	v, err := s.db.Nextval(seqName(seq))
+	v, err := s.db.Nextval(s.catalog(), seqName(seq))
 	if err == nil {
 		s.currval[seqName(seq)] = v
 	}
@@ -860,7 +890,7 @@ func (s *Session) Currval(seq string) (int64, error) {
 
 // Setval implements expr.Env.
 func (s *Session) Setval(seq string, v int64, called bool) (int64, error) {
-	r, err := s.db.Setval(seqName(seq), v, called)
+	r, err := s.db.Setval(s.catalog(), seqName(seq), v, called)
 	if err == nil && called {
 		s.currval[seqName(seq)] = v
 	}
