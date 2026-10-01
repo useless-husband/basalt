@@ -512,11 +512,16 @@ func flattenInner(n Node, leaves *[]Node, preds *[]expr.Expr) {
 	*leaves = append(*leaves, n)
 }
 
+// dpLimit is the largest join for which every join order is considered
+// (dynamic programming over subsets, 3^n splits); larger joins are
+// ordered greedily.
+const dpLimit = 8
+
 func (o *Optimizer) planJoinRegion(j *Join) (Plan, error) {
 	var leaves []Node
 	var preds []expr.Expr
 	flattenInner(j, &leaves, &preds)
-	if len(leaves) > 63 {
+	if len(leaves) > 64 {
 		return nil, pgerr.New(pgerr.StatementTooComplex, "too many tables in one join (%d)", len(leaves))
 	}
 	rels := make([]*joinRel, len(leaves))
@@ -593,7 +598,7 @@ func (o *Optimizer) planJoinRegion(j *Join) (Plan, error) {
 		return out
 	}
 	var result Plan
-	if n <= 12 {
+	if n <= dpLimit {
 		best := make(map[uint64]Plan, 1<<n)
 		for i := 0; i < n; i++ {
 			best[1<<i] = rels[i].plan
@@ -644,6 +649,7 @@ func (o *Optimizer) planJoinRegion(j *Join) (Plan, error) {
 		for mask != full {
 			var bestPlan Plan
 			var bestI int
+			bestCost := math.Inf(1)
 			for i := 0; i < n; i++ {
 				if mask&(1<<i) != 0 {
 					continue
@@ -652,10 +658,10 @@ func (o *Optimizer) planJoinRegion(j *Join) (Plan, error) {
 				for _, c := range o.joinCandidates(JoinInner, cur, rels[i].plan, rels[i], ps, rowsOf(mask|1<<i)) {
 					cost := Estimate(c).Total
 					if len(ps) == 0 {
-						cost += disableCost / 2
+						cost += disableCost / 2 // avoid cross products while a join predicate is available
 					}
-					if bestPlan == nil || cost < Estimate(bestPlan).Total {
-						bestPlan, bestI = c, i
+					if cost < bestCost {
+						bestPlan, bestI, bestCost = c, i, cost
 					}
 				}
 			}

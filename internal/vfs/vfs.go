@@ -122,3 +122,24 @@ func (f *osFile) Size() (int64, error) {
 
 // Join is filepath.Join, re-exported so callers need not import both.
 func Join(elem ...string) string { return filepath.Join(elem...) }
+
+// NoSync wraps a file system and turns Sync into a no-op. It is for tests
+// and benchmarks that measure work other than durability; a database
+// opened on it is not crash safe.
+type NoSync struct{ FS }
+
+type noSyncFile struct{ File }
+
+// OpenFile implements FS.
+func (n NoSync) OpenFile(name string, create bool) (File, error) {
+	f, err := n.FS.OpenFile(name, create)
+	if err != nil {
+		return nil, err
+	}
+	return noSyncFile{f}, nil
+}
+
+// SyncDir implements FS.
+func (n NoSync) SyncDir(string) error { return nil }
+
+func (f noSyncFile) Sync() error { return nil }
