@@ -283,4 +283,4 @@ SHOW transaction_isolation;
 COMMIT;
 COMMIT
 BEGIN ISOLATION LEVEL SERIALIZABLE;
-psql:basic.sql:112: ERROR:  SERIALIZABLE isolation is not supported; basalt provides snapshot isolation (REPEATABLE READ)
+psql:basic.sql:112: ERROR:  SERIALIZABLE isolation is not supported; basalt provides READ COMMITTED and REPEATABLE READ (snapshot isolation)

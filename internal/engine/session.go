@@ -420,7 +420,7 @@ func (s *Session) txnControl(t *sql.TransactionStmt) (*Result, error) {
 	switch t.Kind {
 	case sql.TxnBegin:
 		if t.Isolation == "serializable" {
-			return nil, pgerr.Unsupported("SERIALIZABLE isolation is not supported; basalt provides snapshot isolation (REPEATABLE READ)")
+			return nil, pgerr.Unsupported("SERIALIZABLE isolation is not supported; basalt provides READ COMMITTED and REPEATABLE READ (snapshot isolation)")
 		}
 		if s.explicit {
 			s.Notices = append(s.Notices, "there is already a transaction in progress")
