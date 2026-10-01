@@ -126,10 +126,7 @@ func (o *Optimizer) plan(n Node) (Plan, error) {
 		return o.planScan(x)
 	case *VScan:
 		p := &VScanP{VT: x.VT, Alias: x.Alias, ColIDs: x.ColIDs, Filter: expr.MakeAnd(x.Filters)}
-		rows := 100.0
-		for _, f := range x.Filters {
-			rows *= o.sel(f)
-		}
+		rows := 100.0 * o.andSel(x.Filters)
 		p.E = Est{Rows: math.Max(rows, 1), Total: 1 + 100*cpuTupleCost, Width: o.width(x.ColIDs)}
 		return p, o.planExprs(x.Filters...)
 	case *Values:
@@ -307,7 +304,6 @@ func (o *Optimizer) matchIndex(ix *catalog.Index, colIDs []expr.ColumnID, preds 
 			if c.op == "=" {
 				m.eq = append(m.eq, c.val)
 				m.used = append(m.used, c.pred)
-				m.sel *= o.sel(c.pred)
 				found = true
 				break
 			}
@@ -321,18 +317,17 @@ func (o *Optimizer) matchIndex(ix *catalog.Index, colIDs []expr.ColumnID, preds 
 				if m.lo == nil {
 					m.lo, m.loIncl = c.val, c.op == ">="
 					m.used = append(m.used, c.pred)
-					m.sel *= o.sel(c.pred)
 				}
 			case "<", "<=":
 				if m.hi == nil {
 					m.hi, m.hiIncl = c.val, c.op == "<="
 					m.used = append(m.used, c.pred)
-					m.sel *= o.sel(c.pred)
 				}
 			}
 		}
 		break
 	}
+	m.sel = o.andSel(m.used)
 	return m
 }
 
@@ -343,20 +338,33 @@ func (o *Optimizer) indexHeight(rows float64) float64 {
 // indexScanCost estimates fetching matched rows through an index.
 func (o *Optimizer) indexScanCost(t *catalog.Table, matched float64) (startup, total float64) {
 	pages := o.tablePages(t)
-	startup = o.indexHeight(o.tableRows(t)) * randomPageCost * 0.25
+	rpc := o.randomPageCost()
+	startup = o.indexHeight(o.tableRows(t)) * rpc * 0.25
 	heapPages := math.Min(matched, pages)
-	total = startup + matched*(cpuIndexTupleCost+cpuTupleCost) + heapPages*randomPageCost*0.5 + matched*cpuOperatorCost
+	total = startup + matched*(cpuIndexTupleCost+cpuTupleCost) + heapPages*rpc*0.5 + matched*cpuOperatorCost
 	return startup, total
+}
+
+// repeatedIndexCost is the cost of one of loops index probes that each
+// fetch matched rows. Pages read by earlier probes are likely still
+// cached, so page reads are charged by pagesFetched over all the probes,
+// as PostgreSQL's cost_index does for a loop count above one.
+func (o *Optimizer) repeatedIndexCost(t *catalog.Table, matched, loops float64) float64 {
+	loops = math.Max(loops, 1)
+	rows := o.tableRows(t)
+	b := o.cachePages()
+	rpc := o.randomPageCost()
+	indexPages := math.Max(1, rows/200)
+	io := pagesFetched(loops*matched, o.tablePages(t), b)*rpc*0.5 + pagesFetched(loops, indexPages, b)*rpc*0.25
+	cpu := o.indexHeight(rows)*50*cpuOperatorCost + matched*(cpuIndexTupleCost+cpuTupleCost+cpuOperatorCost)
+	return io/loops + cpu
 }
 
 func (o *Optimizer) seqScan(s *Scan) *SeqScanP {
 	t := s.Table
 	rows := o.tableRows(t)
 	p := &SeqScanP{Table: t, Alias: s.Alias, ColIDs: s.ColIDs, TIDCol: s.TIDCol, Filter: expr.MakeAnd(s.Filters), Lock: s.Lock}
-	sel := 1.0
-	for _, f := range s.Filters {
-		sel *= o.sel(f)
-	}
+	sel := o.andSel(s.Filters)
 	total := o.tablePages(t)*seqPageCost + rows*cpuTupleCost + rows*cpuOperatorCost*float64(len(s.Filters))
 	if !o.enabled("enable_seqscan") {
 		total += disableCost
@@ -368,10 +376,7 @@ func (o *Optimizer) seqScan(s *Scan) *SeqScanP {
 func (o *Optimizer) indexScan(s *Scan, m indexMatch, filters []expr.Expr) *IndexScanP {
 	t := s.Table
 	rows := o.tableRows(t)
-	sel := 1.0
-	for _, f := range filters {
-		sel *= o.sel(f)
-	}
+	sel := o.andSel(filters)
 	matched := math.Max(1, rows*m.sel)
 	if m.ix.Unique && len(m.eq) == len(m.ix.Columns) {
 		matched = 1
@@ -437,7 +442,7 @@ func (o *Optimizer) orderedScan(s *Scan, keys []expr.SortKey) *IndexScanP {
 		if m.lo == nil && m.hi == nil {
 			rows := o.tableRows(s.Table)
 			p.E.Startup, p.E.Total = o.indexScanCost(s.Table, rows)
-			p.E.Total += rows * randomPageCost * 0.25 // unclustered heap access
+			p.E.Total += rows * o.randomPageCost() * 0.25 // unclustered heap access
 			if !o.enabled("enable_indexscan") {
 				p.E.Startup += disableCost
 				p.E.Total += disableCost
@@ -854,7 +859,19 @@ func (o *Optimizer) joinCandidates(kind JoinKind, outer, inner Plan, innerRel *j
 					continue
 				}
 				// The inner scan rechecks its own filters and the join keys.
-				isp := o.indexScan(s, m, append(append([]expr.Expr(nil), s.Filters...), preds...))
+				filters := append(append([]expr.Expr(nil), s.Filters...), preds...)
+				isp := o.indexScan(s, m, filters)
+				if !o.enabled("enable_indexscan") {
+					continue
+				}
+				// Charge each probe its share of the page reads of all
+				// the probes.
+				matched := math.Max(1, o.tableRows(s.Table)*m.sel)
+				if m.ix.Unique && len(m.eq) == len(m.ix.Columns) {
+					matched = 1
+				}
+				isp.E.Total = o.repeatedIndexCost(s.Table, matched, oe.Rows) + matched*cpuOperatorCost*float64(len(filters))
+				isp.E.Startup = math.Min(isp.E.Startup, isp.E.Total)
 				nl := &NestLoopP{Kind: kind, Outer: outer, Inner: isp}
 				per := Estimate(isp)
 				total := oe.Total + oe.Rows*per.Total + outRows*cpuTupleCost + penalty("enable_nestloop")

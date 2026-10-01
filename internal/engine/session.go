@@ -113,6 +113,7 @@ var defaultSettings = map[string]string{
 	"enable_hashjoin":                     "on",
 	"enable_mergejoin":                    "on",
 	"enable_nestloop":                     "on",
+	"random_page_cost":                    "1.1",
 	"client_min_messages":                 "notice",
 	"bytea_output":                        "hex",
 	"block_size":                          "8192",
@@ -139,6 +140,9 @@ func (db *DB) NewSession(user, database string) *Session {
 		s.settings[k] = v
 	}
 	s.settings["session_authorization"] = user
+	// The planner assumes this much data stays cached between repeated
+	// index probes; by default, basalt's own buffer pool.
+	s.settings["effective_cache_size"] = strconv.Itoa(db.store.Pool().Capacity()*storage.PageSize/1024) + "kB"
 	db.register(s)
 	return s
 }

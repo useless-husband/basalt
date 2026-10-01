@@ -3,16 +3,18 @@ package planner
 import (
 	"math"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/useless-husband/basalt/internal/catalog"
 	"github.com/useless-husband/basalt/internal/expr"
 	"github.com/useless-husband/basalt/internal/types"
 )
 
-// Cost constants, PostgreSQL's defaults.
+// Cost constants, PostgreSQL's defaults. random_page_cost and
+// effective_cache_size are settings (see randomPageCost and cachePages).
 const (
 	seqPageCost       = 1.0
-	randomPageCost    = 4.0
 	cpuTupleCost      = 0.01
 	cpuIndexTupleCost = 0.005
 	cpuOperatorCost   = 0.0025
@@ -22,7 +24,61 @@ const (
 	defaultRangeSel  = 1.0 / 3
 	defaultSel       = 0.25
 	defaultNDistinct = 200.0
+
+	// basalt's default random_page_cost is 1.1, the value commonly
+	// recommended for SSDs, rather than PostgreSQL's 4.0 (which models
+	// spinning disks): basalt's pages come from its buffer pool or an SSD.
+	defaultRandomPageCost = 1.1
+	defaultCachePages     = 16384
 )
+
+func (o *Optimizer) randomPageCost() float64 {
+	if o.Setting != nil {
+		if v, err := strconv.ParseFloat(strings.TrimSpace(o.Setting("random_page_cost")), 64); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return defaultRandomPageCost
+}
+
+// cachePages returns effective_cache_size in pages: how much of the
+// database the planner assumes stays cached across repeated index probes.
+func (o *Optimizer) cachePages() float64 {
+	if o.Setting == nil {
+		return defaultCachePages
+	}
+	v := strings.TrimSpace(o.Setting("effective_cache_size"))
+	unit := 8.0 // kB per unit; a bare number counts pages, as in PostgreSQL
+	for _, u := range []struct {
+		suffix string
+		kb     float64
+	}{{"kB", 1}, {"MB", 1024}, {"GB", 1024 * 1024}, {"TB", 1024 * 1024 * 1024}} {
+		if strings.HasSuffix(v, u.suffix) {
+			v, unit = strings.TrimSpace(strings.TrimSuffix(v, u.suffix)), u.kb
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n <= 0 {
+		return defaultCachePages
+	}
+	return math.Max(1, n*unit/8)
+}
+
+// pagesFetched is the Mackert-Lohman estimate of the distinct page reads
+// needed to fetch n tuples at random from a relation of t pages with b
+// pages of cache (PostgreSQL's index_pages_fetched).
+func pagesFetched(n, t, b float64) float64 {
+	t = math.Max(t, 1)
+	if t <= b {
+		return math.Min(2*t*n/(2*t+n), t)
+	}
+	lim := 2 * t * b / (2*t - b)
+	if n <= lim {
+		return 2 * t * n / (2*t + n)
+	}
+	return b + (n-lim)*(t-b)/t
+}
 
 // colStats returns statistics for a base table column, if analyzed.
 func (o *Optimizer) colStats(id expr.ColumnID) (*catalog.Table, *catalog.ColumnStats) {
@@ -156,11 +212,7 @@ func (o *Optimizer) sel(e expr.Expr) float64 {
 		}
 		return 1
 	case *expr.And:
-		s := 1.0
-		for _, a := range x.Args {
-			s *= o.sel(a)
-		}
-		return s
+		return o.andSel(x.Args)
 	case *expr.Or:
 		s := 0.0
 		for _, a := range x.Args {
@@ -233,6 +285,110 @@ func (o *Optimizer) sel(e expr.Expr) float64 {
 	return defaultSel
 }
 
+// histPos places a value on a line for interpolation inside a histogram
+// bucket.
+func histPos(v types.Value) (float64, bool) {
+	switch v.K {
+	case types.KInt, types.KFloat, types.KNumeric:
+		return v.AsFloat(), true
+	case types.KDate, types.KTimestamp, types.KTimestampTZ:
+		return float64(v.I), true
+	}
+	return 0, false
+}
+
+// andSel estimates a conjunction. Conditions are assumed independent,
+// except that a lower and an upper bound on the same column (x >= a AND
+// x < b) are combined into the fraction between them, as PostgreSQL's
+// clauselist_selectivity does; multiplying them would count the rows
+// below a and above b as both passing.
+func (o *Optimizer) andSel(args []expr.Expr) float64 {
+	type bounds struct {
+		lo, hi       float64
+		hasLo, hasHi bool
+		nonNull      float64
+	}
+	var ranges map[expr.ColumnID]*bounds
+	var order []expr.ColumnID
+	s := 1.0
+	for _, a := range args {
+		c, lower, sel, ok := o.rangeBound(a)
+		if !ok {
+			s *= o.sel(a)
+			continue
+		}
+		if ranges == nil {
+			ranges = map[expr.ColumnID]*bounds{}
+		}
+		b := ranges[c.ID]
+		if b == nil {
+			b = &bounds{nonNull: 1}
+			if _, cs := o.colStats(c.ID); cs != nil {
+				b.nonNull = 1 - cs.NullFrac
+			}
+			ranges[c.ID] = b
+			order = append(order, c.ID)
+		}
+		if lower {
+			if !b.hasLo || sel < b.lo {
+				b.lo = sel
+			}
+			b.hasLo = true
+		} else {
+			if !b.hasHi || sel < b.hi {
+				b.hi = sel
+			}
+			b.hasHi = true
+		}
+	}
+	for _, id := range order {
+		b := ranges[id]
+		switch {
+		case b.hasLo && b.hasHi:
+			s *= math.Max(0.0001, b.lo+b.hi-b.nonNull)
+		case b.hasLo:
+			s *= b.lo
+		default:
+			s *= b.hi
+		}
+	}
+	return s
+}
+
+// rangeBound recognizes col < const, col >= const and the like when the
+// column has a histogram, returning whether it is a lower bound and its
+// selectivity.
+func (o *Optimizer) rangeBound(e expr.Expr) (*expr.Col, bool, float64, bool) {
+	call, ok := e.(*expr.Call)
+	if !ok || len(call.Args) != 2 || !expr.IsComparison(call.Fn.Op) {
+		return nil, false, 0, false
+	}
+	op := call.Fn.Op
+	c, isCol := stripCast(call.Args[0]).(*expr.Col)
+	v := call.Args[1]
+	if !isCol {
+		c, isCol = stripCast(call.Args[1]).(*expr.Col)
+		v = call.Args[0]
+		op = expr.CommuteOp(op)
+	}
+	k, isConst := v.(*expr.Const)
+	if !isCol || !isConst || k.V.IsNull() {
+		return nil, false, 0, false
+	}
+	var lower bool
+	switch op {
+	case ">", ">=":
+		lower = true
+	case "<", "<=":
+	default:
+		return nil, false, 0, false
+	}
+	if _, cs := o.colStats(c.ID); cs == nil || len(cs.HistVals) < 2 || cs.HistVals[0].K != k.V.K {
+		return nil, false, 0, false
+	}
+	return c, lower, o.compareSel(c, op, v), true
+}
+
 func stripCast(e expr.Expr) expr.Expr {
 	if c, ok := e.(*expr.Cast); ok {
 		return c.Arg
@@ -293,13 +449,12 @@ func (o *Optimizer) compareSel(c *expr.Col, op string, v expr.Expr) float64 {
 		frac = 1
 	default:
 		// Linear interpolation inside the bucket for numeric values.
-		lo, hi := h[i-1], h[i]
 		within := 0.5
-		if lo.K == types.KInt || lo.K == types.KFloat || lo.K == types.KNumeric {
-			a, b, x := lo.AsFloat(), hi.AsFloat(), k.V.AsFloat()
-			if b > a {
-				within = (x - a) / (b - a)
-			}
+		a, aok := histPos(h[i-1])
+		b, bok := histPos(h[i])
+		x, xok := histPos(k.V)
+		if aok && bok && xok && b > a {
+			within = (x - a) / (b - a)
 		}
 		frac = (float64(i-1) + within) / float64(len(h)-1)
 	}

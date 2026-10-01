@@ -30,6 +30,8 @@ func TestPlannerUsesStatistics(t *testing.T) {
 	q(t, s, `CREATE TABLE small (gid int PRIMARY KEY, label text)`)
 	q(t, s, `INSERT INTO big SELECT g, g % 50, CASE WHEN g % 10 = 0 THEN 'rare' ELSE 'common' END FROM generate_series(1, 20000) g`)
 	q(t, s, `INSERT INTO small SELECT g, 'g' || g FROM generate_series(0, 49) g`)
+	q(t, s, `CREATE TABLE events (id int PRIMARY KEY, day date)`)
+	q(t, s, `INSERT INTO events SELECT g, DATE '2020-01-01' + g / 20 FROM generate_series(0, 14599) g`)
 	q(t, s, `ANALYZE`)
 	within := func(got, want int) bool {
 		return float64(got) >= 0.7*float64(want) && float64(got) <= 1.3*float64(want)
@@ -43,6 +45,10 @@ func TestPlannerUsesStatistics(t *testing.T) {
 		{`SELECT * FROM big WHERE tag = 'rare'`, 2000},
 		{`SELECT * FROM big WHERE tag = 'common'`, 18000},
 		{`SELECT * FROM big b JOIN small s ON s.gid = b.grp`, 20000},
+		// Two bounds on one column select the rows between them.
+		{`SELECT * FROM big WHERE id >= 5000 AND id < 6000`, 1000},
+		{`SELECT * FROM big WHERE id BETWEEN 12000 AND 15999`, 4000},
+		{`SELECT * FROM events WHERE day >= '2021-03-01' AND day < '2021-04-01'`, 31 * 20},
 	} {
 		got, plan := estimate(t, s, c.query)
 		if !within(got, c.want) {

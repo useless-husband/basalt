@@ -53,6 +53,9 @@ func newPool(file vfs.File, wal *WAL, nframes int) *Pool {
 var errPoolFull = pgerr.New(pgerr.ConfigurationLimitExceeded, "no unpinned buffers available")
 
 // victim finds an unpinned frame using the clock algorithm. Called with mu.
+// Capacity returns the number of frames.
+func (p *Pool) Capacity() int { return len(p.frames) }
+
 func (p *Pool) victim() (*Frame, error) {
 	n := len(p.frames)
 	for i := 0; i < 3*n; i++ {
