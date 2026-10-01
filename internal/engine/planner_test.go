@@ -107,6 +107,11 @@ func TestSubqueryDecorrelation(t *testing.T) {
 		{`SELECT count(*) FROM a WHERE a.x = 3 OR EXISTS (SELECT 1 FROM b WHERE b.aid = a.id)`, "SubPlan", "549"},
 		{`SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.id LIMIT 1)`, "SubPlan", "499"},
 		{`SELECT count(*) FROM a WHERE a.x IN (SELECT max(b.v) FROM b WHERE b.aid = a.id)`, "SubPlan", "50"},
+		// Above GROUP BY the join reads the group column.
+		{`SELECT count(*) FROM (SELECT a.x FROM a GROUP BY a.x HAVING EXISTS (SELECT 1 FROM b WHERE b.v = a.x)) s`, "Semi Join", "7"},
+		{`SELECT count(*) FROM (SELECT a.x FROM a GROUP BY a.x HAVING a.x IN (SELECT b.v FROM b WHERE b.aid = a.x)) s`, "Semi Join", "6"},
+		// A volatile left operand of IN must be evaluated once per row.
+		{`SELECT count(*) FROM a WHERE a.x + (random() * 0)::int IN (SELECT b.v FROM b WHERE b.aid = a.id)`, "SubPlan", "300"},
 	} {
 		plan := q(t, s, "EXPLAIN "+c.query)
 		if !strings.Contains(plan, c.node) {
@@ -118,4 +123,18 @@ func TestSubqueryDecorrelation(t *testing.T) {
 		expect(t, s, c.query, c.want)
 		q(t, s, `RESET enable_hashjoin`)
 	}
+}
+
+func TestPlannerSettings(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("t", "t")
+	initial := q(t, s, `SHOW effective_cache_size`)
+	q(t, s, `SET effective_cache_size = '1GB'`)
+	expect(t, s, `SHOW effective_cache_size`, "1GB")
+	q(t, s, `RESET effective_cache_size`)
+	expect(t, s, `SHOW effective_cache_size`, initial)
+	expect(t, s, `SHOW random_page_cost`, "1.1")
+	qerr(t, s, `SET random_page_cost = 'x'`, "22023")
+	qerr(t, s, `SET effective_cache_size = '-1MB'`, "22023")
 }

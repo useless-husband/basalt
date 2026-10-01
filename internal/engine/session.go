@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"sort"
 	"strconv"
@@ -56,7 +57,8 @@ type Session struct {
 	secret   int32
 	user     string
 	database string
-	appName  string // application_name from the startup packet (read by other sessions)
+	appName  string            // application_name from the startup packet (read by other sessions)
+	initial  map[string]string // settings as the session started, for RESET
 
 	txn       *txn.Txn
 	explicit  bool
@@ -143,6 +145,7 @@ func (db *DB) NewSession(user, database string) *Session {
 	// The planner assumes this much data stays cached between repeated
 	// index probes; by default, basalt's own buffer pool.
 	s.settings["effective_cache_size"] = strconv.Itoa(db.store.Pool().Capacity()*storage.PageSize/1024) + "kB"
+	s.initial = maps.Clone(s.settings)
 	db.register(s)
 	return s
 }
@@ -819,11 +822,13 @@ func (s *Session) set(x *sql.SetStmt) (*Result, error) {
 	}
 	if x.Reset {
 		if name == "all" {
-			for k, v := range defaultSettings {
+			for k, v := range s.initial {
 				s.settings[k] = v
 			}
-		} else if v, ok := defaultSettings[name]; ok {
+		} else if v, ok := s.initial[name]; ok {
 			s.settings[name] = v
+		} else {
+			delete(s.settings, name)
 		}
 		return &Result{Tag: "SET"}, nil
 	}
@@ -847,6 +852,14 @@ func (s *Session) set(x *sql.SetStmt) (*Result, error) {
 		if !strings.Contains(strings.ToUpper(v), "ISO") {
 			return nil, pgerr.Unsupported("only the ISO DateStyle is supported")
 		}
+	case "random_page_cost":
+		if f, err := strconv.ParseFloat(v, 64); err != nil || f < 0 {
+			return nil, pgerr.New(pgerr.InvalidParameterValue, "invalid value for parameter \"random_page_cost\": \"%s\"", x.Value)
+		}
+	case "effective_cache_size":
+		if !validMemorySetting(v) {
+			return nil, pgerr.New(pgerr.InvalidParameterValue, "invalid value for parameter \"effective_cache_size\": \"%s\"", x.Value)
+		}
 	case "statement_timeout":
 		v = strings.TrimSuffix(v, "ms")
 		if _, err := strconv.Atoi(v); err != nil {
@@ -855,6 +868,21 @@ func (s *Session) set(x *sql.SetStmt) (*Result, error) {
 	}
 	s.settings[name] = v
 	return &Result{Tag: "SET"}, nil
+}
+
+// validMemorySetting accepts a positive number with an optional kB, MB,
+// GB or TB unit (a bare number counts 8 kB pages), as the planner reads
+// effective_cache_size.
+func validMemorySetting(v string) bool {
+	v = strings.TrimSpace(v)
+	for _, u := range []string{"kB", "MB", "GB", "TB"} {
+		if strings.HasSuffix(v, u) {
+			v = strings.TrimSpace(strings.TrimSuffix(v, u))
+			break
+		}
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	return err == nil && f > 0
 }
 
 func (s *Session) show(x *sql.ShowStmt) (*Result, error) {

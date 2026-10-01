@@ -677,6 +677,11 @@ func (r *Rewriter) semiJoin(outer Node, c expr.Expr) (Node, bool) {
 	if !ok || len(sq.Outer) == 0 {
 		return nil, false
 	}
+	// The left operand of IN is evaluated once per outer row by the
+	// subplan, but once per candidate pair by a join.
+	if sq.Arg != nil && (expr.IsVolatile(sq.Arg) || expr.HasSubquery(sq.Arg)) {
+		return nil, false
+	}
 	switch {
 	case sq.Kind == expr.SubExists && !sq.Not:
 	case sq.Kind == expr.SubAny && sq.Cmp != nil && sq.Cmp.Op == "=" && !sq.Not && !anti:
@@ -744,6 +749,22 @@ func (r *Rewriter) semiJoin(outer Node, c expr.Expr) (Node, bool) {
 	}
 	if sq.Kind == expr.SubAny {
 		corr = append(corr, &expr.Call{Fn: sq.Cmp, Args: []expr.Expr{sq.Arg, key}, T: types.Bool})
+	}
+	// Above a GROUP BY, an outer column is carried by the Aggregate's
+	// group column (see Subquery.Remap); the join reads that column.
+	if len(sq.Remap) > 0 {
+		for i, t := range corr {
+			corr[i] = expr.Map(t, func(e expr.Expr) expr.Expr {
+				if col, ok := e.(*expr.Col); ok {
+					if to, ok := sq.Remap[col.ID]; ok {
+						n := *col
+						n.ID = to
+						return &n
+					}
+				}
+				return e
+			})
+		}
 	}
 	kind := JoinSemi
 	if anti {

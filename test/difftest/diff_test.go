@@ -212,8 +212,12 @@ func (g *gen) query() string {
 		aggs := []string{"count(*)", "count(" + g.pick(sc.ints) + ")", "sum(" + g.intExpr(sc, 1) + ")",
 			"min(" + g.intExpr(sc, 1) + ")", "max(" + g.pick(sc.ints) + ")", "max(" + g.pick(sc.strs) + ")"}
 		q := "SELECT " + key + ", " + g.pick(aggs) + ", " + g.pick(aggs) + " FROM " + from + where + " GROUP BY " + key
-		if g.r.Intn(3) == 0 {
+		switch g.r.Intn(4) {
+		case 0:
 			q += " HAVING count(*) > " + strconv.Itoa(g.r.Intn(3))
+		case 1:
+			// Correlated through the grouping column.
+			q += " HAVING " + g.subPred(scope{ints: []string{key}})
 		}
 		return q
 	case 2: // aggregate without GROUP BY
