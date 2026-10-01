@@ -139,12 +139,30 @@ func (g *gen) pred(sc scope, depth int) string {
 		}
 	case 8:
 		if depth > 0 {
-			t := g.tables[g.r.Intn(len(g.tables))]
-			inner := scope{ints: append(append([]string{}, sc.ints...), "z.a", "z.b", "z.c")}
-			return "EXISTS (SELECT 1 FROM " + t.name + " z WHERE z.c = " + g.pick(sc.ints) + " AND " + g.pred(inner, 0) + ")"
+			return g.subPred(sc)
 		}
 	}
 	return g.intExpr(sc, depth) + " " + g.pick([]string{"=", "<>", "<", "<=", ">", ">="}) + " " + g.intExpr(sc, depth)
+}
+
+// subPred is a correlated subquery predicate: EXISTS, NOT EXISTS or IN.
+// As a top-level WHERE conjunct the planner turns it into a semi or anti
+// join; nested under OR or NOT it runs as a subplan.
+func (g *gen) subPred(sc scope) string {
+	t := g.tables[g.r.Intn(len(g.tables))]
+	inner := scope{ints: append(append([]string{}, sc.ints...), "z.a", "z.b", "z.c")}
+	where := "z.c = " + g.pick(sc.ints)
+	if g.r.Intn(4) == 0 {
+		where += " AND z.a " + g.pick([]string{"<", ">=", "<>"}) + " " + g.pick(sc.ints)
+	}
+	where += " AND " + g.pred(inner, 0)
+	switch g.r.Intn(4) {
+	case 0:
+		return "NOT EXISTS (SELECT 1 FROM " + t.name + " z WHERE " + where + ")"
+	case 1:
+		return g.pick(sc.ints) + " IN (SELECT z.b FROM " + t.name + " z WHERE " + where + ")"
+	}
+	return "EXISTS (SELECT 1 FROM " + t.name + " z WHERE " + where + ")"
 }
 
 func colsOf(alias string, t table) scope {
@@ -184,6 +202,9 @@ func (g *gen) query() string {
 	where := ""
 	if g.r.Intn(4) != 0 {
 		where = " WHERE " + g.pred(sc, 2)
+		if g.r.Intn(3) == 0 {
+			where += " AND " + g.subPred(sc)
+		}
 	}
 	switch g.r.Intn(6) {
 	case 0, 1: // aggregate with GROUP BY

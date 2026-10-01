@@ -531,7 +531,223 @@ func nullRejecting(p expr.Expr, side map[expr.ColumnID]bool) bool {
 // Rewrite applies all rules to a logical plan, including the plans of
 // subqueries.
 func (r *Rewriter) Rewrite(n Node) Node {
+	n = r.decorrelate(n)
 	n = r.foldPlan(n)
 	n = r.pushdown(n)
 	return n
+}
+
+// ---- subquery decorrelation ----
+
+// decorrelate turns WHERE conjuncts of the form EXISTS (correlated
+// subquery), NOT EXISTS (...) and x IN (correlated subquery) into semi and
+// anti joins, so they can be executed with a hash or index join instead of
+// running the subquery once per outer row.
+func (r *Rewriter) decorrelate(n Node) Node {
+	switch x := n.(type) {
+	case *Filter:
+		x.Input = r.decorrelate(x.Input)
+		node := x.Input
+		var keep []expr.Expr
+		for _, c := range expr.Conjuncts(x.Cond) {
+			if j, ok := r.semiJoin(node, c); ok {
+				node = j
+				continue
+			}
+			keep = append(keep, c)
+		}
+		return wrapFilter(node, keep)
+	case *Project:
+		x.Input = r.decorrelate(x.Input)
+	case *Join:
+		x.Left = r.decorrelate(x.Left)
+		x.Right = r.decorrelate(x.Right)
+	case *Aggregate:
+		x.Input = r.decorrelate(x.Input)
+	case *Sort:
+		x.Input = r.decorrelate(x.Input)
+	case *Limit:
+		x.Input = r.decorrelate(x.Input)
+	case *Distinct:
+		x.Input = r.decorrelate(x.Input)
+	case *SetOp:
+		x.Left = r.decorrelate(x.Left)
+		x.Right = r.decorrelate(x.Right)
+	}
+	return n
+}
+
+// nodeExprsLogical lists the expressions of one logical node.
+func nodeExprsLogical(n Node) []expr.Expr {
+	switch x := n.(type) {
+	case *Scan:
+		return x.Filters
+	case *VScan:
+		return x.Filters
+	case *Values:
+		var out []expr.Expr
+		for _, r := range x.Rows {
+			out = append(out, r...)
+		}
+		return out
+	case *FuncScan:
+		return x.Args
+	case *Filter:
+		return []expr.Expr{x.Cond}
+	case *Project:
+		return x.Exprs
+	case *Join:
+		if x.Cond != nil {
+			return []expr.Expr{x.Cond}
+		}
+	case *Aggregate:
+		out := append([]expr.Expr(nil), x.GroupBy...)
+		for _, a := range x.Aggs {
+			out = append(out, a.Args...)
+			if a.Filter != nil {
+				out = append(out, a.Filter)
+			}
+		}
+		return out
+	case *Sort:
+		var out []expr.Expr
+		for _, k := range x.Keys {
+			out = append(out, k.E)
+		}
+		return out
+	case *Limit:
+		var out []expr.Expr
+		if x.Limit != nil {
+			out = append(out, x.Limit)
+		}
+		if x.Offset != nil {
+			out = append(out, x.Offset)
+		}
+		return out
+	case *Distinct:
+		return x.On
+	}
+	return nil
+}
+
+func logicalChildren(n Node) []Node {
+	switch x := n.(type) {
+	case *Filter:
+		return []Node{x.Input}
+	case *Project:
+		return []Node{x.Input}
+	case *Join:
+		return []Node{x.Left, x.Right}
+	case *Aggregate:
+		return []Node{x.Input}
+	case *Sort:
+		return []Node{x.Input}
+	case *Limit:
+		return []Node{x.Input}
+	case *Distinct:
+		return []Node{x.Input}
+	case *SetOp:
+		return []Node{x.Left, x.Right}
+	}
+	return nil
+}
+
+// referencesAny reports whether any expression in the subtree reads one of
+// the columns.
+func referencesAny(n Node, cols map[expr.ColumnID]bool) bool {
+	for _, e := range nodeExprsLogical(n) {
+		if refersAny(e, cols) {
+			return true
+		}
+	}
+	for _, c := range logicalChildren(n) {
+		if referencesAny(c, cols) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Rewriter) semiJoin(outer Node, c expr.Expr) (Node, bool) {
+	anti := false
+	if n, ok := c.(*expr.Not); ok {
+		c, anti = n.Arg, true
+	}
+	sq, ok := c.(*expr.Subquery)
+	if !ok || len(sq.Outer) == 0 {
+		return nil, false
+	}
+	switch {
+	case sq.Kind == expr.SubExists && !sq.Not:
+	case sq.Kind == expr.SubAny && sq.Cmp != nil && sq.Cmp.Op == "=" && !sq.Not && !anti:
+	default:
+		return nil, false // NOT IN has different NULL semantics from an anti join
+	}
+	inner, ok := sq.Plan.(Node)
+	if !ok {
+		return nil, false
+	}
+	// Peel off what does not matter for existence.
+	var key expr.Expr
+	for {
+		switch x := inner.(type) {
+		case *Project:
+			if sq.Kind == expr.SubAny {
+				if key != nil || len(x.Exprs) != 1 {
+					return nil, false
+				}
+				key = x.Exprs[0]
+			}
+			inner = x.Input
+			continue
+		case *Sort:
+			inner = x.Input
+			continue
+		case *Distinct:
+			if len(x.On) == 0 {
+				inner = x.Input
+				continue
+			}
+		}
+		break
+	}
+	if sq.Kind == expr.SubAny && key == nil {
+		return nil, false
+	}
+	outerCols := colSet(sq.Outer)
+	var corr, local []expr.Expr
+	if f, ok := inner.(*Filter); ok {
+		for _, t := range expr.Conjuncts(f.Cond) {
+			if refersAny(t, outerCols) {
+				if expr.HasSubquery(t) || expr.IsVolatile(t) {
+					return nil, false
+				}
+				corr = append(corr, t)
+			} else {
+				local = append(local, t)
+			}
+		}
+		inner = wrapFilter(f.Input, local)
+	}
+	// The correlation must be confined to the conjuncts we lift into the
+	// join condition (no outer references deeper in the subquery), and the
+	// subquery must not compute anything per group or limit its rows.
+	if referencesAny(inner, outerCols) {
+		return nil, false
+	}
+	if key != nil && refersAny(key, outerCols) {
+		return nil, false
+	}
+	switch inner.(type) {
+	case *Aggregate, *Limit, *SetOp, *Values:
+		return nil, false
+	}
+	if sq.Kind == expr.SubAny {
+		corr = append(corr, &expr.Call{Fn: sq.Cmp, Args: []expr.Expr{sq.Arg, key}, T: types.Bool})
+	}
+	kind := JoinSemi
+	if anti {
+		kind = JoinAnti
+	}
+	return &Join{Kind: kind, Left: outer, Right: r.decorrelate(inner), Cond: expr.MakeAnd(corr)}, true
 }

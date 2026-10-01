@@ -74,3 +74,42 @@ func TestPlannerUsesStatistics(t *testing.T) {
 	}
 	expect(t, s, `SELECT count(*), sum(b.id) FROM big b JOIN small s ON s.gid = b.grp`, "20000|200010000")
 }
+
+// TestSubqueryDecorrelation checks that correlated EXISTS, NOT EXISTS and
+// IN conjuncts become semi and anti joins with the same results as the
+// per-row subplan, and that the forms with different semantics (NOT IN,
+// subqueries under OR, LIMIT, aggregates) stay subplans. The expected
+// counts were computed with sqlite3 on the same data.
+func TestSubqueryDecorrelation(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("t", "t")
+	q(t, s, `CREATE TABLE a (id int PRIMARY KEY, x int)`)
+	q(t, s, `CREATE TABLE b (id int PRIMARY KEY, aid int, v int)`)
+	q(t, s, `INSERT INTO a SELECT g, g % 10 FROM generate_series(1, 1000) g`)
+	q(t, s, `INSERT INTO b SELECT g, g % 500, g % 7 FROM generate_series(1, 3000) g`)
+	q(t, s, `INSERT INTO b VALUES (5000, NULL, 1), (5001, 7, NULL)`)
+	q(t, s, `ANALYZE`)
+	for _, c := range []struct {
+		query, node, want string
+	}{
+		{`SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.id AND b.v > 2)`, "Semi Join", "499"},
+		{`SELECT count(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.id)`, "Anti Join", "501"},
+		{`SELECT count(*) FROM a WHERE a.x IN (SELECT b.v FROM b WHERE b.aid = a.id)`, "Semi Join", "300"},
+		{`SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.id AND b.v < a.x)`, "Semi Join", "443"},
+		{`SELECT count(*) FROM a WHERE a.x NOT IN (SELECT b.v FROM b WHERE b.aid = a.id)`, "SubPlan", "699"},
+		{`SELECT count(*) FROM a WHERE a.x = 3 OR EXISTS (SELECT 1 FROM b WHERE b.aid = a.id)`, "SubPlan", "549"},
+		{`SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.id LIMIT 1)`, "SubPlan", "499"},
+		{`SELECT count(*) FROM a WHERE a.x IN (SELECT max(b.v) FROM b WHERE b.aid = a.id)`, "SubPlan", "50"},
+	} {
+		plan := q(t, s, "EXPLAIN "+c.query)
+		if !strings.Contains(plan, c.node) {
+			t.Errorf("%s: expected %s in\n%s", c.query, c.node, plan)
+		}
+		expect(t, s, c.query, c.want)
+		// So does the nested loop form.
+		q(t, s, `SET enable_hashjoin = off`)
+		expect(t, s, c.query, c.want)
+		q(t, s, `RESET enable_hashjoin`)
+	}
+}
