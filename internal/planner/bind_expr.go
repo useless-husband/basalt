@@ -543,10 +543,21 @@ func (b *Binder) bindBinary(x *sql.BinaryExpr, lvl *level) (expr.Expr, error) {
 		}
 		return nil, err
 	}
-	if l, err = b.coerce(l, bo.Left, coerceImplicit); err != nil {
+	lm, rm := coerceImplicit, coerceImplicit
+	if x.Op == "||" && bo.Ret.Oid == types.OidText {
+		// text || anynonarray: the other operand goes through its output
+		// function, as PostgreSQL's anytextcat does.
+		if l.Type().IsString() {
+			rm = coerceExplicit
+		}
+		if r.Type().IsString() {
+			lm = coerceExplicit
+		}
+	}
+	if l, err = b.coerce(l, bo.Left, lm); err != nil {
 		return nil, err
 	}
-	if r, err = b.coerce(r, bo.Right, coerceImplicit); err != nil {
+	if r, err = b.coerce(r, bo.Right, rm); err != nil {
 		return nil, err
 	}
 	return &expr.Call{Fn: bo.Fn, Args: []expr.Expr{l, r}, T: bo.Ret}, nil

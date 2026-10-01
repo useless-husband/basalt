@@ -20,13 +20,14 @@ type Optimizer struct {
 	// Setting returns a planner setting such as enable_hashjoin.
 	Setting  func(name string) string
 	Rewriter *Rewriter
+	binder   *Binder
 	cols     []ColInfo
 	planned  map[Node]Plan
 }
 
 // NewOptimizer returns an optimizer for plans built by binder b.
 func NewOptimizer(cat *catalog.Catalog, b *Binder, rw *Rewriter, pages func(*catalog.Table) int, setting func(string) string) *Optimizer {
-	return &Optimizer{Cat: cat, Pages: pages, Setting: setting, Rewriter: rw, cols: b.cols, planned: map[Node]Plan{}}
+	return &Optimizer{Cat: cat, Pages: pages, Setting: setting, Rewriter: rw, binder: b, planned: map[Node]Plan{}}
 }
 
 func (o *Optimizer) enabled(name string) bool {
@@ -39,6 +40,8 @@ func (o *Optimizer) enabled(name string) bool {
 
 // Optimize rewrites and plans a logical plan.
 func (o *Optimizer) Optimize(n Node) (Plan, error) {
+	// The binder may have added columns since the optimizer was created.
+	o.cols = o.binder.cols
 	n = o.Rewriter.Rewrite(n)
 	return o.plan(n)
 }
