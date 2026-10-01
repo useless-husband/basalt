@@ -37,19 +37,19 @@ type Options struct {
 
 // DB is an open database.
 type DB struct {
-	opts   Options
-	store  *storage.Store
-	txns   *txn.Manager
-	cat    atomic.Pointer[catalog.Catalog]
+	opts       Options
+	store      *storage.Store
+	txns       *txn.Manager
+	cat        atomic.Pointer[catalog.Catalog]
 	catVersion atomic.Uint64
-	seqMu  sync.Mutex
-	seqs   map[uint32]*seqState
-	vacMu  sync.Mutex
-	start  time.Time
-	pids   atomic.Int64
-	stop   chan struct{}
-	wg     sync.WaitGroup
-	closed atomic.Bool
+	seqMu      sync.Mutex
+	seqs       map[uint32]*seqState
+	vacMu      sync.Mutex
+	start      time.Time
+	pids       atomic.Int64
+	stop       chan struct{}
+	wg         sync.WaitGroup
+	closed     atomic.Bool
 
 	sessMu   sync.Mutex
 	sessions map[int64]*Session
