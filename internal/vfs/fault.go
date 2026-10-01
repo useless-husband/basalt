@@ -136,11 +136,14 @@ func (fs *FaultFS) Crash(r *rand.Rand, opt CrashOptions) *FaultFS {
 		}
 		for i, w := range kept {
 			data := w.data
-			if i == torn && len(data) > 1 {
+			if i == torn {
+				// A torn write reaches the disk as a prefix of whole
+				// sectors (none or all of them are the "kept" and "lost"
+				// cases).
 				sectors := (len(data) + opt.SectorSize - 1) / opt.SectorSize
-				cut := r.Intn(sectors) * opt.SectorSize
-				if cut == 0 {
-					cut = r.Intn(len(data))
+				cut := 0
+				if sectors > 1 {
+					cut = (1 + r.Intn(sectors-1)) * opt.SectorSize
 				}
 				data = data[:cut]
 			}
