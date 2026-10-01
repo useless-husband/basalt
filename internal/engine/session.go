@@ -119,7 +119,7 @@ var defaultSettings = map[string]string{
 	"row_security":                        "on",
 	"synchronous_commit":                  "on",
 	"jit":                                 "off",
-	"basalt_version":                      "basalt " + Version,
+	"basalt_version":                      "PostgreSQL " + ServerVersion + " (basalt " + Version + ", an independent implementation, not PostgreSQL)",
 }
 
 // ReportedParameters are sent to clients at startup (ParameterStatus).
