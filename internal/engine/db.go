@@ -293,6 +293,15 @@ func (db *DB) unregister(s *Session) {
 	db.sessMu.Unlock()
 }
 
+// CancelAll interrupts every running statement (server shutdown).
+func (db *DB) CancelAll() {
+	db.sessMu.Lock()
+	defer db.sessMu.Unlock()
+	for _, s := range db.sessions {
+		s.cancel()
+	}
+}
+
 // Cancel requests cancellation of the statement running in the session
 // with the given backend key.
 func (db *DB) Cancel(pid int64, secret int32) bool {

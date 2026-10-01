@@ -92,6 +92,9 @@ func (s *Server) Close() {
 		c.Close()
 	}
 	s.mu.Unlock()
+	if s.DB != nil {
+		s.DB.CancelAll()
+	}
 	s.wg.Wait()
 }
 
