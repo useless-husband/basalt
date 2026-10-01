@@ -302,6 +302,6 @@ func (db *DB) Cancel(pid int64, secret int32) bool {
 	if s == nil || s.secret != secret {
 		return false
 	}
-	s.cancelRequested.Store(true)
+	s.cancel()
 	return true
 }

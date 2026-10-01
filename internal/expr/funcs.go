@@ -1107,7 +1107,18 @@ func init() {
 	catalogFn("pg_get_function_result", types.Text, 1, 1, types.Oid)
 	catalogFn("array_to_string_oids", types.Text, 1, 1, types.Text)
 	catalogFn("pg_stat_get_numscans", types.Int8, 1, 1, types.Oid)
+	catalogFn("pg_relation_is_publishable", types.Bool, 1, 1, types.Regclass)
+	catalogFn("pg_get_triggerdef", types.Text, 1, 2, types.Oid, types.Bool)
+	catalogFn("pg_get_ruledef", types.Text, 1, 2, types.Oid, types.Bool)
+	catalogFn("pg_tablespace_location", types.Text, 1, 1, types.Oid)
+	catalogFn("pg_get_function_arguments", types.Text, 1, 1, types.Oid)
 	catalogFn("basalt_stats", types.Text, 0, 0)
+	// Tables are never partitioned: a table is its own ancestor and root.
+	for _, n := range []string{"pg_partition_ancestors", "pg_partition_root"} {
+		reg(&Builtin{Name: n, Min: 1, Max: 1, Resolve: fixed(types.Regclass, types.Regclass), Fn: fn(func(_ *Ctx, a []types.Value) (types.Value, error) {
+			return a[0], nil
+		})})
+	}
 }
 
 // toChar implements a useful subset of to_char.

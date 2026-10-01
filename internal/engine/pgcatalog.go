@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/useless-husband/basalt/internal/catalog"
@@ -619,6 +620,10 @@ func (s *Session) CatalogFunc(name string, a []types.Value) (types.Value, error)
 			return null, nil
 		}
 		return s.constraintDef(cat, uint32(a[0].I))
+	case "pg_relation_is_publishable":
+		return vBool(false), nil
+	case "pg_get_triggerdef", "pg_get_ruledef", "pg_tablespace_location", "pg_get_function_arguments":
+		return null, nil
 	case "pg_get_viewdef", "pg_get_statisticsobjdef_columns", "pg_get_partkeydef", "pg_get_function_identity_arguments",
 		"pg_get_function_result", "obj_description", "col_description", "shobj_description":
 		return null, nil
@@ -710,6 +715,9 @@ func (s *Session) regCast(cat *catalog.Catalog, v types.Value, from, to uint32) 
 	switch {
 	case isText(from):
 		name := strings.TrimSpace(v.S)
+		if n, err := strconv.ParseInt(name, 10, 64); err == nil && n >= 0 {
+			return vInt(n), nil // a numeric OID
+		}
 		switch to {
 		case types.OidRegclass:
 			n := strings.TrimPrefix(strings.TrimPrefix(name, "public."), "pg_catalog.")

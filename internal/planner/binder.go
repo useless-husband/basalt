@@ -336,7 +336,7 @@ func (b *Binder) bindValues(rows [][]sql.Expr, parent *level, target []types.T) 
 		} else {
 			t = types.Unknown
 			for _, r := range bound {
-				ct, ok := expr.CommonType(t, r[j].Type())
+				ct, ok := unify(t, r[j].Type())
 				if !ok {
 					return nil, pgerr.New(pgerr.DatatypeMismatch, "VALUES types %s and %s cannot be matched", t, r[j].Type())
 				}

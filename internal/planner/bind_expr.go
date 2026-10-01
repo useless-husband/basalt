@@ -386,7 +386,7 @@ func (b *Binder) bindExpr(e sql.Expr, lvl *level) (expr.Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			ct, ok := expr.CommonType(et, e.Type())
+			ct, ok := unify(et, e.Type())
 			if !ok {
 				return nil, pgerr.New(pgerr.DatatypeMismatch, "ARRAY types %s and %s cannot be matched", et, e.Type())
 			}
@@ -656,7 +656,7 @@ func (b *Binder) bindInList(left sql.Expr, list []sql.Expr, not bool, lvl *level
 		if err != nil {
 			return nil, err
 		}
-		ct, ok := expr.CommonType(t, e.Type())
+		ct, ok := unify(t, e.Type())
 		if !ok {
 			return nil, pgerr.New(pgerr.UndefinedFunction, "operator does not exist: %s = %s", t, e.Type())
 		}
@@ -863,7 +863,7 @@ func (b *Binder) bindCase(x *sql.CaseExpr, lvl *level) (expr.Expr, error) {
 	}
 	t := types.Unknown
 	for _, r := range results {
-		ct, ok := expr.CommonType(t, r.Type())
+		ct, ok := unify(t, r.Type())
 		if !ok {
 			return nil, pgerr.New(pgerr.DatatypeMismatch, "CASE types %s and %s cannot be matched", t, r.Type())
 		}
@@ -924,7 +924,7 @@ func (b *Binder) bindFunc(x *sql.FuncCall, lvl *level) (expr.Expr, error) {
 		}
 		t := types.Unknown
 		for _, a := range args {
-			ct, ok := expr.CommonType(t, a.Type())
+			ct, ok := unify(t, a.Type())
 			if !ok {
 				return nil, pgerr.New(pgerr.DatatypeMismatch, "%s types %s and %s cannot be matched", strings.ToUpper(name), t, a.Type())
 			}
@@ -1077,4 +1077,16 @@ func exprsEq(a, b []expr.Expr) bool {
 		}
 	}
 	return true
+}
+
+// unify folds types for CASE, VALUES, COALESCE and the like: unknown
+// (NULL or an untyped literal) adapts to the other type.
+func unify(t, u types.T) (types.T, bool) {
+	switch {
+	case u.Oid == types.OidUnknown:
+		return t, true
+	case t.Oid == types.OidUnknown:
+		return u, true
+	}
+	return expr.CommonType(t, u)
 }

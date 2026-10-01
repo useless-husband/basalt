@@ -301,6 +301,19 @@ func Explain(p Plan, opt ExplainOptions) []string {
 		}
 	}
 	walk = func(p Plan, depth int, label string) {
+		if pr, ok := p.(*ProjectP); ok && !opt.Verbose && depth > 0 || ok && !opt.Verbose && len(pr.children()) == 1 && !isResultOnly(pr) {
+			// Projections are folded into their input, as in PostgreSQL.
+			for _, e := range pr.Exprs {
+				expr.Walk(e, func(x expr.Expr) bool {
+					if sq, ok := x.(*expr.Subquery); ok {
+						subplans = append(subplans, sq)
+					}
+					return true
+				})
+			}
+			walk(pr.Input, depth, label)
+			return
+		}
 		indent := strings.Repeat("      ", max(depth-1, 0))
 		prefix := ""
 		if depth > 0 {
@@ -359,6 +372,13 @@ func Explain(p Plan, opt ExplainOptions) []string {
 		}
 	}
 	return lines
+}
+
+// isResultOnly reports whether a projection sits on a one-row Result
+// (SELECT without FROM), which PostgreSQL shows as "Result".
+func isResultOnly(p *ProjectP) bool {
+	v, ok := p.Input.(*ValuesP)
+	return ok && len(v.Rows) == 1 && len(v.ColIDs) == 0
 }
 
 func joinName(k JoinKind) string {

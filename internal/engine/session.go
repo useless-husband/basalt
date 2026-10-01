@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/useless-husband/basalt/internal/catalog"
@@ -66,8 +66,9 @@ type Session struct {
 	prepared map[string]*Prepared
 	currval  map[string]int64
 
-	cancelRequested atomic.Bool
-	stmtCancel      context.CancelFunc
+	cancelMu   sync.Mutex
+	curCancel  context.CancelCauseFunc
+	stmtCancel func()
 	// Notices collected during the last statement.
 	Notices []string
 }
@@ -206,42 +207,39 @@ func (s *Session) endTxn(commit bool) error {
 // statement context and cancellation
 
 func (s *Session) startStatement() context.Context {
-	s.cancelRequested.Store(false)
 	s.stmtStart = nowMicros()
 	s.Notices = nil
 	ctx, cancel := context.WithCancelCause(context.Background())
+	stop := func() { cancel(nil) }
 	if ms, _ := strconv.Atoi(s.settings["statement_timeout"]); ms > 0 {
 		var c2 context.CancelFunc
 		ctx, c2 = context.WithTimeoutCause(ctx, time.Duration(ms)*time.Millisecond,
 			pgerr.New(pgerr.QueryCanceled, "canceling statement due to statement timeout"))
-		s.stmtCancel = func() { c2(); cancel(nil) }
-	} else {
-		s.stmtCancel = func() { cancel(nil) }
+		stop = func() { c2(); cancel(nil) }
 	}
-	go func() {
-		// Translate a cancel request into context cancellation so that
-		// lock waits are interrupted too.
-		t := time.NewTicker(20 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if s.cancelRequested.Load() {
-					cancel(pgerr.New(pgerr.QueryCanceled, "canceling statement due to user request"))
-					return
-				}
-			}
-		}
-	}()
+	s.cancelMu.Lock()
+	s.curCancel = cancel
+	s.stmtCancel = stop
+	s.cancelMu.Unlock()
 	return ctx
 }
 
 func (s *Session) endStatement() {
-	if s.stmtCancel != nil {
-		s.stmtCancel()
-		s.stmtCancel = nil
+	s.cancelMu.Lock()
+	stop := s.stmtCancel
+	s.stmtCancel, s.curCancel = nil, nil
+	s.cancelMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+// cancel interrupts the running statement (CancelRequest).
+func (s *Session) cancel() {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	if s.curCancel != nil {
+		s.curCancel(pgerr.New(pgerr.QueryCanceled, "canceling statement due to user request"))
 	}
 }
 
