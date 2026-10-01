@@ -68,7 +68,9 @@ func startServer(t *testing.T, bin, dir string, logf *os.File) *server {
 	return &server{cmd: cmd, port: port}
 }
 
-func (s *server) url() string { return fmt.Sprintf("postgres://crash@127.0.0.1:%d/crash?sslmode=disable", s.port) }
+func (s *server) url() string {
+	return fmt.Sprintf("postgres://crash@127.0.0.1:%d/crash?sslmode=disable", s.port)
+}
 
 // kill sends SIGKILL to the server process (by PID) and reaps it.
 func (s *server) kill() {
