@@ -154,6 +154,10 @@ type Subquery struct {
 	ID    int
 	// Label is the EXPLAIN name, e.g. "SubPlan 1".
 	Label string
+	// Remap redirects an outer column to the column that carries its value
+	// in the evaluating operator's row (after grouping, a grouped column
+	// is carried by the Aggregate's group column).
+	Remap map[ColumnID]ColumnID
 }
 
 // ArrayCons is ARRAY[...].
@@ -337,59 +341,80 @@ func Map(e Expr, fn func(Expr) Expr) Expr {
 	if e == nil {
 		return nil
 	}
+	return fn(mapChildren(e, func(c Expr) Expr { return Map(c, fn) }))
+}
+
+// Replace rebuilds e top-down: if fn returns a non-nil expression for a
+// node, that node (and its subtree) is replaced; otherwise its children
+// are processed.
+func Replace(e Expr, fn func(Expr) Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	if r := fn(e); r != nil {
+		return r
+	}
+	return mapChildren(e, func(c Expr) Expr { return Replace(c, fn) })
+}
+
+// mapChildren returns a copy of e with f applied to each direct child.
+func mapChildren(e Expr, f func(Expr) Expr) Expr {
 	mapAll := func(es []Expr) []Expr {
 		out := make([]Expr, len(es))
 		for i, x := range es {
-			out[i] = Map(x, fn)
+			out[i] = f(x)
 		}
 		return out
 	}
-	var n Expr
+	opt := func(x Expr) Expr {
+		if x == nil {
+			return nil
+		}
+		return f(x)
+	}
 	switch x := e.(type) {
 	case *Call:
-		n = &Call{Fn: x.Fn, Args: mapAll(x.Args), T: x.T}
+		return &Call{Fn: x.Fn, Args: mapAll(x.Args), T: x.T}
 	case *And:
-		n = &And{Args: mapAll(x.Args)}
+		return &And{Args: mapAll(x.Args)}
 	case *Or:
-		n = &Or{Args: mapAll(x.Args)}
+		return &Or{Args: mapAll(x.Args)}
 	case *Not:
-		n = &Not{Arg: Map(x.Arg, fn)}
+		return &Not{Arg: f(x.Arg)}
 	case *Case:
-		c := &Case{T: x.T, Else: Map(x.Else, fn)}
+		c := &Case{T: x.T, Else: opt(x.Else)}
 		for _, w := range x.Whens {
-			c.Whens = append(c.Whens, When{Map(w.Cond, fn), Map(w.Then, fn)})
+			c.Whens = append(c.Whens, When{f(w.Cond), f(w.Then)})
 		}
-		n = c
+		return c
 	case *Cast:
-		n = &Cast{Arg: Map(x.Arg, fn), T: x.T, Explicit: x.Explicit}
+		return &Cast{Arg: f(x.Arg), T: x.T, Explicit: x.Explicit}
 	case *IsNull:
-		n = &IsNull{Arg: Map(x.Arg, fn), Not: x.Not}
+		return &IsNull{Arg: f(x.Arg), Not: x.Not}
 	case *IsBool:
-		n = &IsBool{Arg: Map(x.Arg, fn), What: x.What, Not: x.Not}
+		return &IsBool{Arg: f(x.Arg), What: x.What, Not: x.Not}
 	case *Distinct:
-		n = &Distinct{L: Map(x.L, fn), R: Map(x.R, fn), Not: x.Not}
+		return &Distinct{L: f(x.L), R: f(x.R), Not: x.Not}
 	case *InList:
-		n = &InList{Arg: Map(x.Arg, fn), List: mapAll(x.List), Not: x.Not}
+		return &InList{Arg: f(x.Arg), List: mapAll(x.List), Not: x.Not}
 	case *Coalesce:
-		n = &Coalesce{Args: mapAll(x.Args), T: x.T}
+		return &Coalesce{Args: mapAll(x.Args), T: x.T}
 	case *NullIf:
-		n = &NullIf{A: Map(x.A, fn), B: Map(x.B, fn), T: x.T}
+		return &NullIf{A: f(x.A), B: f(x.B), T: x.T}
 	case *MinMax:
-		n = &MinMax{Args: mapAll(x.Args), Greatest: x.Greatest, T: x.T}
+		return &MinMax{Args: mapAll(x.Args), Greatest: x.Greatest, T: x.T}
 	case *Subquery:
 		c := *x
-		c.Arg = Map(x.Arg, fn)
-		n = &c
+		c.Arg = opt(x.Arg)
+		return &c
 	case *ArrayCons:
-		n = &ArrayCons{Elems: mapAll(x.Elems), T: x.T}
+		return &ArrayCons{Elems: mapAll(x.Elems), T: x.T}
 	case *Subscript:
-		n = &Subscript{Arr: Map(x.Arr, fn), Idx: Map(x.Idx, fn), T: x.T}
+		return &Subscript{Arr: f(x.Arr), Idx: f(x.Idx), T: x.T}
 	case *RowTuple:
-		n = &RowTuple{Elems: mapAll(x.Elems)}
-	default:
-		n = e
+		return &RowTuple{Elems: mapAll(x.Elems)}
 	}
-	return fn(n)
+	return e
 }
 
 // Conjuncts splits an AND tree into its terms.

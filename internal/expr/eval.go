@@ -519,7 +519,11 @@ func compileSubquery(sq *Subquery, l Layout) (Fn, error) {
 	}
 	refs := make([]outerRef, len(sq.Outer))
 	for i, id := range sq.Outer {
-		pos, ok := l[id]
+		src := id
+		if r, ok := sq.Remap[id]; ok {
+			src = r
+		}
+		pos, ok := l[src]
 		if !ok {
 			pos = -1
 		}

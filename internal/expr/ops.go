@@ -648,3 +648,6 @@ func ResolveUnary(op string, t types.T) (*Func, types.T, types.T, error) {
 	}
 	return nil, types.Unknown, types.Unknown, pgerr.New(pgerr.UndefinedFunction, "operator does not exist: %s %s", op, t)
 }
+
+// MustBinary returns the arithmetic function for op on numeric type t.
+func MustBinary(op string, t types.T) *Func { return arith(op, t) }
