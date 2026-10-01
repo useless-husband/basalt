@@ -232,22 +232,21 @@ SELECT count(*) AS orders_left FROM orders;
 ANALYZE;
 ANALYZE
 EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE id = 3;
-        QUERY PLAN         
----------------------------
- Seq Scan on orders
-   Filter: (orders.id = 3)
+               QUERY PLAN               
+----------------------------------------
+ Index Scan using orders_pkey on orders
+   Index Cond: (orders.id = 3)
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.country = 'GB';
-                    QUERY PLAN                    
---------------------------------------------------
+                       QUERY PLAN                       
+--------------------------------------------------------
  Nested Loop
-   Join Filter: (o.customer_id = c.id)
    ->  Seq Scan on customers c
          Filter: (c.country = 'GB'::character(2))
-   ->  Materialize
-         ->  Seq Scan on orders o
-(6 rows)
+   ->  Index Scan using orders_customer_idx on orders o
+         Index Cond: (o.customer_id = c.id)
+(5 rows)
 
 EXPLAIN (COSTS OFF) SELECT customer_id, sum(amount) FROM orders GROUP BY customer_id ORDER BY 2 DESC LIMIT 2;
                  QUERY PLAN                  
