@@ -1,0 +1,138 @@
+package engine
+
+import (
+	"math/rand"
+	"strings"
+	"testing"
+
+	"github.com/useless-husband/basalt/internal/pgerr"
+	"github.com/useless-husband/basalt/internal/types"
+	"github.com/useless-husband/basalt/internal/vfs"
+)
+
+func openMem(t *testing.T) (*DB, vfs.FS) {
+	t.Helper()
+	fs := vfs.NewFaultFS()
+	db, err := Open(Options{Dir: "/db", FS: fs, PoolPages: 256, CheckpointInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, fs
+}
+
+// q runs a statement and renders its rows as "a|b" lines.
+func q(t *testing.T, s *Session, query string) string {
+	t.Helper()
+	res, err := s.Exec(query)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	return render(res[len(res)-1])
+}
+
+func render(r *Result) string {
+	var lines []string
+	for _, row := range r.Rows {
+		var parts []string
+		for i, v := range row {
+			if v.IsNull() {
+				parts = append(parts, "NULL")
+			} else {
+				parts = append(parts, types.ToText(v, r.Columns[i].Type))
+			}
+		}
+		lines = append(lines, strings.Join(parts, "|"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func qerr(t *testing.T, s *Session, query, code string) {
+	t.Helper()
+	_, err := s.Exec(query)
+	if err == nil {
+		t.Fatalf("%s: expected error %s", query, code)
+	}
+	if pgerr.Code(err) != code {
+		t.Fatalf("%s: got %s (%v), want %s", query, pgerr.Code(err), err, code)
+	}
+}
+
+func expect(t *testing.T, s *Session, query, want string) {
+	t.Helper()
+	if got := q(t, s, query); got != want {
+		t.Fatalf("%s:\n got: %q\nwant: %q", query, got, want)
+	}
+}
+
+func TestBasicSQL(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("test", "test")
+	q(t, s, `CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL, score numeric(6,2), created date DEFAULT '2024-01-01')`)
+	q(t, s, `INSERT INTO t VALUES (1, 'alice', 90.5), (2, 'bob', 72), (3, 'carol', NULL)`)
+	expect(t, s, `SELECT id, name, score, created FROM t ORDER BY id`, "1|alice|90.50|2024-01-01\n2|bob|72.00|2024-01-01\n3|carol|NULL|2024-01-01")
+	expect(t, s, `SELECT count(*), sum(score), avg(score) FROM t`, "3|162.50|81.2500000000000000")
+	expect(t, s, `SELECT name FROM t WHERE score > 80 OR score IS NULL ORDER BY name`, "alice\ncarol")
+	q(t, s, `UPDATE t SET score = score + 1 WHERE id = 2`)
+	expect(t, s, `SELECT score FROM t WHERE id = 2`, "73.00")
+	q(t, s, `DELETE FROM t WHERE id = 3`)
+	expect(t, s, `SELECT count(*) FROM t`, "2")
+	qerr(t, s, `INSERT INTO t VALUES (1, 'dup', 1)`, pgerr.UniqueViolation)
+	qerr(t, s, `INSERT INTO t VALUES (4, NULL, 1)`, pgerr.NotNullViolation)
+	qerr(t, s, `SELECT nope FROM t`, pgerr.UndefinedColumn)
+	expect(t, s, `INSERT INTO t VALUES (5, 'eve', 1) RETURNING id, upper(name)`, "5|EVE")
+	expect(t, s, `SELECT 1 + 2 * 3, 7 / 2, 7.0 / 2, 'a' || 'b', NULL IS NULL`, "7|3|3.5000000000000000|ab|t")
+}
+
+func TestJoinsAndSubqueries(t *testing.T) {
+	db, _ := openMem(t)
+	defer db.Close()
+	s := db.NewSession("test", "test")
+	q(t, s, `CREATE TABLE a (id int PRIMARY KEY, v text)`)
+	q(t, s, `CREATE TABLE b (id int PRIMARY KEY, a_id int REFERENCES a(id), w int)`)
+	q(t, s, `INSERT INTO a VALUES (1,'x'),(2,'y'),(3,'z')`)
+	q(t, s, `INSERT INTO b VALUES (10,1,5),(11,1,6),(12,2,7)`)
+	expect(t, s, `SELECT a.v, b.w FROM a JOIN b ON a.id = b.a_id ORDER BY b.w`, "x|5\nx|6\ny|7")
+	expect(t, s, `SELECT a.v, count(b.id) FROM a LEFT JOIN b ON a.id = b.a_id GROUP BY a.v ORDER BY a.v`, "x|2\ny|1\nz|0")
+	expect(t, s, `SELECT v FROM a WHERE id IN (SELECT a_id FROM b) ORDER BY v`, "x\ny")
+	expect(t, s, `SELECT v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)`, "z")
+	expect(t, s, `SELECT v, (SELECT max(w) FROM b WHERE b.a_id = a.id) FROM a ORDER BY v`, "x|6\ny|7\nz|NULL")
+	expect(t, s, `WITH c AS (SELECT a_id, sum(w) AS s FROM b GROUP BY a_id) SELECT a.v, c.s FROM a JOIN c ON c.a_id = a.id ORDER BY 1`, "x|11\ny|7")
+	expect(t, s, `SELECT id FROM a UNION SELECT a_id FROM b ORDER BY 1`, "1\n2\n3")
+	expect(t, s, `SELECT id FROM a EXCEPT SELECT a_id FROM b`, "3")
+	expect(t, s, `SELECT id FROM a INTERSECT SELECT a_id FROM b ORDER BY 1`, "1\n2")
+	qerr(t, s, `INSERT INTO b VALUES (13, 9, 1)`, pgerr.ForeignKeyViolation)
+	qerr(t, s, `DELETE FROM a WHERE id = 1`, pgerr.ForeignKeyViolation)
+	expect(t, s, `SELECT CASE WHEN w > 5 THEN 'big' ELSE 'small' END, count(*) FROM b GROUP BY 1 ORDER BY 1`, "big|2\nsmall|1")
+}
+
+func TestTransactionsAndRecovery(t *testing.T) {
+	fs := vfs.NewFaultFS()
+	db, err := Open(Options{Dir: "/db", FS: fs, PoolPages: 128, CheckpointInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.NewSession("test", "test")
+	q(t, s, `CREATE TABLE acct (id int PRIMARY KEY, bal int)`)
+	q(t, s, `INSERT INTO acct SELECT g, 100 FROM generate_series(1, 500) g`)
+	q(t, s, `BEGIN`)
+	q(t, s, `UPDATE acct SET bal = bal - 10 WHERE id = 1`)
+	q(t, s, `UPDATE acct SET bal = bal + 10 WHERE id = 2`)
+	q(t, s, `COMMIT`)
+	q(t, s, `BEGIN`)
+	q(t, s, `UPDATE acct SET bal = 0`)
+	q(t, s, `ROLLBACK`)
+	expect(t, s, `SELECT sum(bal), min(bal), max(bal) FROM acct`, "50000|90|110")
+	// Crash: unsynced writes are lost.
+	db.Abandon()
+	db2, err := Open(Options{Dir: "/db", FS: fs.Crash(nil2rand(), vfs.CrashOptions{KeepProbability: 0.3, TornProbability: 0.5}), PoolPages: 128, CheckpointInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	s2 := db2.NewSession("test", "test")
+	expect(t, s2, `SELECT sum(bal), count(*) FROM acct`, "50000|500")
+	expect(t, s2, `SELECT bal FROM acct WHERE id IN (1, 2) ORDER BY id`, "90\n110")
+}
+
+func nil2rand() *rand.Rand { return rand.New(rand.NewSource(1)) }

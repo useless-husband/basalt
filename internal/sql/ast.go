@@ -198,6 +198,8 @@ type ColumnDef struct {
 	Type        *TypeName
 	NotNull     bool
 	Default     Expr
+	DefaultSQL  string
+	Identity    bool
 	Constraints []*Constraint // column constraints (PK, UNIQUE, CHECK, REFERENCES)
 }
 

@@ -90,9 +90,30 @@ type Heap struct {
 	s     *Store
 	first PageID
 
-	mu   sync.Mutex // serializes extension; protects last and fsm
-	last PageID
-	fsm  []PageID // pages that may have free space (filled by vacuum)
+	mu     sync.Mutex // serializes extension; protects last, npages and fsm
+	last   PageID
+	npages int      // 0 until counted
+	fsm    []PageID // pages that may have free space (filled by vacuum)
+}
+
+// PageCount returns the number of pages in the heap.
+func (h *Heap) PageCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.npages == 0 {
+		n := 0
+		for id := h.first; id != InvalidPage; {
+			f, err := h.s.pool.Read(id)
+			if err != nil {
+				return max(n, 1)
+			}
+			n++
+			id = PageID(u32(f.Data, offHeapNext))
+			h.s.pool.Release(f)
+		}
+		h.npages = n
+	}
+	return h.npages
 }
 
 func initHeapPage(p []byte) {
@@ -260,6 +281,9 @@ func (h *Heap) extend(last PageID, tuple []byte) (TID, bool, error) {
 		return 0, false, err
 	}
 	h.last = id
+	if h.npages > 0 {
+		h.npages++
+	}
 	return MakeTID(id, uint16(slot)), true, nil
 }
 

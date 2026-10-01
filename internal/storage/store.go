@@ -493,3 +493,13 @@ func (c *control) write(redo LSN) error {
 func (s *Store) IsClosed() bool { return s.closed.Load() }
 
 var errNoSpace = errors.New("no space on page")
+
+// CatalogRoot reads the catalog pointer through the mini-transaction (the
+// meta page may already be latched by it).
+func (m *Mtr) CatalogRoot() (PageID, error) {
+	meta, err := m.Page(0)
+	if err != nil {
+		return 0, err
+	}
+	return PageID(u32(meta, offMetaCatalog)), nil
+}

@@ -1667,11 +1667,13 @@ func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 			cd.NotNull = true
 		case p.acceptKw("null"):
 		case p.acceptKw("default"):
+			start := p.peek().Pos
 			e, err := p.parseBinary(precCompare + 1)
 			if err != nil {
 				return nil, err
 			}
 			cd.Default = e
+			cd.DefaultSQL = strings.TrimSpace(p.src[start:p.peek().Pos])
 		case p.acceptKw("primary", "key"):
 			cd.Constraints = append(cd.Constraints, &Constraint{Name: conName, Kind: ConPrimaryKey})
 		case p.acceptKw("unique"):
@@ -1700,7 +1702,7 @@ func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 						return nil, err
 					}
 				}
-				cd.Default = &FuncCall{Name: "__identity__"}
+				cd.Identity = true
 			} else {
 				return nil, pgerr.Unsupported("generated columns are not supported")
 			}
