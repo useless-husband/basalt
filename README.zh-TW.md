@@ -56,14 +56,14 @@ ANALYZE
 EXPLAIN ANALYZE SELECT a.owner, sum(t.amount) FROM accounts a JOIN transfers t ON t.src = a.id WHERE a.id < 100 GROUP BY a.owner;
                                                               QUERY PLAN
 ---------------------------------------------------------------------------------------------------------------------------------------
- HashAggregate  (cost=5.04..5.05 rows=1 width=15) (actual time=0.015..0.015 rows=1 loops=1)
+ HashAggregate  (cost=2.12..2.13 rows=1 width=15) (actual time=0.011..0.011 rows=1 loops=1)
    Group Key: a.owner
-   ->  Nested Loop  (cost=2.00..5.04 rows=1 width=63) (actual time=0.013..0.013 rows=1 loops=1)
-         ->  Seq Scan on transfers t  (cost=0.00..1.01 rows=1 width=40) (actual time=0.002..0.002 rows=1 loops=1)
-         ->  Index Scan using accounts_pkey on accounts a  (cost=2.00..4.02 rows=1 width=23) (actual time=0.007..0.007 rows=1 loops=1)
+   ->  Nested Loop  (cost=0.55..2.11 rows=1 width=63) (actual time=0.009..0.009 rows=1 loops=1)
+         ->  Seq Scan on transfers t  (cost=0.00..1.01 rows=1 width=40) (actual time=0.003..0.003 rows=1 loops=1)
+         ->  Index Scan using accounts_pkey on accounts a  (cost=0.55..1.09 rows=1 width=23) (actual time=0.005..0.005 rows=1 loops=1)
                Index Cond: (a.id = t.src)
                Filter: (a.id < 100)
- Execution Time: 0.022 ms
+ Execution Time: 0.018 ms
 (8 rows)
 
 SELECT count(*), sum(balance) FROM accounts;
@@ -79,7 +79,7 @@ SELECT count(*), sum(balance) FROM accounts;
 
 **SQL。** CREATE/DROP/TRUNCATE TABLE、CREATE/DROP INDEX、CREATE SEQUENCE、ALTER TABLE（ADD COLUMN、RENAME、ADD CONSTRAINT）；PRIMARY KEY、NOT NULL、UNIQUE、CHECK 與 FOREIGN KEY（支援 ON DELETE/UPDATE CASCADE 和 SET NULL）；serial 與 identity 欄位；帶 RETURNING 和 ON CONFLICT（DO NOTHING / DO UPDATE）的 INSERT；UPDATE ... FROM；DELETE ... USING；SELECT 支援 inner、left、right、full、cross join、WHERE、GROUP BY/HAVING、聚合函式（count、sum、avg、min、max、bool_and/or、string_agg、array_agg、stddev/variance，可搭配 DISTINCT、FILTER、ORDER BY）、含 NULLS FIRST/LAST 的 ORDER BY、LIMIT/OFFSET、DISTINCT 與 DISTINCT ON、純量、IN、EXISTS、ANY/ALL 子查詢（相關或不相關）、非遞迴 CTE、UNION/INTERSECT/EXCEPT [ALL]、CASE、COALESCE/NULLIF/GREATEST/LEAST，以及正確的三值 NULL 邏輯；型別有 smallint、integer、bigint、real、double precision、numeric(p,s)（任意精度）、text、varchar(n)、char(n)、boolean、date、timestamp、timestamptz、interval、bytea 和一維陣列；約 120 個內建函式；EXPLAIN 與 EXPLAIN ANALYZE。DDL 具有交易性。
 
-**查詢規劃器。** 解析名稱並推斷參數型別的 binder、邏輯計畫、改寫規則（常數摺疊、把條件推進 join、掃描和 GROUP BY 之下、外部連接轉內部連接），以及使用 ANALYZE 統計資料（列數、NULL 比例、相異值數量、最常見值、直方圖）的成本式實體規劃。它在循序掃描與索引掃描之間選擇，用子集合動態規劃決定連接順序（超過八張表改用貪婪法），並挑選雜湊、合併、巢狀迴圈或索引巢狀迴圈連接；ORDER BY ... LIMIT 可以依索引順序讀取或使用 top-N 排序。
+**查詢規劃器。** 解析名稱並推斷參數型別的 binder、邏輯計畫、改寫規則（常數摺疊、把相關的 EXISTS／NOT EXISTS／IN 轉成 semi join 與 anti join、把條件推進 join、掃描和 GROUP BY 之下、外部連接轉內部連接），以及使用 ANALYZE 統計資料（列數、NULL 比例、相異值數量、最常見值、直方圖）的成本式實體規劃。它在循序掃描與索引掃描之間選擇，用子集合動態規劃決定連接順序（超過八張表改用貪婪法），並挑選雜湊、合併、巢狀迴圈或索引巢狀迴圈連接；ORDER BY ... LIMIT 可以依索引順序讀取或使用 top-N 排序。
 
 **儲存。** 單一資料檔、8 KiB 且帶檢查碼的分頁、時鐘演算法的緩衝池、槽式資料頁、會分裂與合併的 B+ 樹索引、分段的預寫式日誌與群組提交、以原子方式記錄頁面差異或整頁影像的迷你交易（因此當機不會留下分裂一半的 B+ 樹，撕裂的頁也會被修復）、尖銳檢查點、重做式復原，以及 macOS 上的 `F_FULLFSYNC`。
 
@@ -120,15 +120,15 @@ SELECT count(*), sum(balance) FROM accounts;
 | 項目 | 指令 | 結果 |
 |---|---|---|
 | 單元與整合測試（所有套件） | `make test`、`make race` | 通過；CI 在 Linux 和 macOS 上以 `-race` 執行 |
-| 真正的 psql 客戶端 | `make psql-test` | 265 行 psql 輸出（DDL、`\d`、`\copy`、連接、帶 SQLSTATE 的錯誤、交易、EXPLAIN）與 [`test/psql/basic.expected`](test/psql/basic.expected) 完全相同 |
+| 真正的 psql 客戶端 | `make psql-test` | 264 行 psql 輸出（DDL、`\d`、`\copy`、連接、帶 SQLSTATE 的錯誤、交易、EXPLAIN）與 [`test/psql/basic.expected`](test/psql/basic.expected) 完全相同 |
 | Go 驅動程式 pgx | `go test ./internal/pgwire` | 二進位格式的型別來回轉換（numeric、時間戳、bytea、interval）、批次、錯誤欄位、交易、COPY、取消、多客戶端並行 |
 | Python 驅動程式 psycopg 3 | `make python-test` | 7 個測試：型別、例外類別、交易、COPY 進出、隔離、識別字、取消 |
 | SQLite 的 sqllogictest 題庫 | `make slt` | **57 個檔案、382,574 筆中通過 382,491 筆（99.98%）**：`select1`–`select5` 10,706/10,706，`random/*`（各類別前 10 個檔案）371,516/371,544，`evidence/*` 269/324；題庫標記 `skipif postgresql` 的 144,203 筆略過 |
-| 與 sqlite3 對答案 | `make difftest` | 35,000 條隨機查詢（種子 1–8）在含 NULL 的隨機資料表上結果完全相同 |
+| 與 sqlite3 對答案 | `make difftest` | 40,000 條隨機查詢（`BASALT_DIFFTEST_SEED` 1–8、`BASALT_DIFFTEST_QUERIES=5000`），包含相關的 EXISTS、NOT EXISTS 與 IN，在含 NULL 的隨機資料表上結果完全相同 |
 | 當機安全（殺掉行程） | `make crash-test` | 4 個並行寫入者下以 PID 送 `SIGKILL` 30 輪：每筆已確認的提交都在、回滾或從未提交的資料都看不到、總金額守恆、索引與資料表一致 |
 | 當機安全（停電模型） | `go test ./internal/storage -run Recovery` | 30 次隨機化的故障檔案系統當機（未 sync 的寫入遺失、其中一筆撕裂）：所有已 flush 的記錄都恢復，B+ 樹不變式成立 |
 | 隔離 | `go test ./internal/engine -run 'No\|Skew\|Deadlock\|ReadCommitted\|Bank'` | REPEATABLE READ 防止髒讀、不可重複讀、幻讀、更新遺失與讀取偏斜；寫入偏斜被證明可能發生；死結能被偵測；16 個客戶端轉帳時稽核者看到的總額不變 |
-| 規劃器使用統計資料 | `go test ./internal/engine -run Planner` | 估計值與實際列數相差 30% 以內；索引或循序掃描、雜湊建表端、依索引順序的 LIMIT 與合併連接都如預期被選中 |
+| 規劃器使用統計資料 | `go test ./internal/engine -run 'Planner\|Decorrelation'` | 估計值與實際列數相差 30% 以內（包括日期的雙邊範圍）；索引或循序掃描、雜湊建表端、依索引順序的 LIMIT 與合併連接都如預期被選中；EXISTS、NOT EXISTS 與 IN 變成 semi join 與 anti join，結果與 sqlite3 相同 |
 
 sqllogictest 沒通過的分兩類：一是 PostgreSQL 與 SQLite 規則本來就不同、但題庫沒有標記的地方（整數溢位與除以零會報錯；`NULLIF(int, numeric)` 的結果是 numeric），二是 basalt 沒有的功能（trigger、view、`REPLACE`、`REINDEX`）。測試程式會印出每一個失敗原因；題庫在測試時從固定的 commit 下載，不放在這個儲存庫裡。
 
@@ -151,21 +151,21 @@ python3 bench/tpcb/sqlite_tpcb.py --scale 8 --clients 1,8 --duration 20
 
 | 設定 | 1 個客戶端 | 8 個客戶端 | 16 個客戶端 |
 |---|---:|---:|---:|
-| basalt 經 TCP，持久化（F_FULLFSYNC、群組提交） | 218 | 608 | 756 |
-| SQLite 同一行程，WAL，`synchronous=FULL`、`fullfsync=ON` | 247 | 238 | |
-| basalt 經 TCP，`-unsafe-no-fsync` | 1,900 | 12,132 | 15,957 |
-| basalt 同一行程，無網路、不 fsync | 2,617 | 33,288 | |
-| SQLite 同一行程，WAL，`synchronous=NORMAL`（每次提交不 fsync） | 30,567 | 31,144 | |
+| basalt 經 TCP，持久化（F_FULLFSYNC、群組提交） | 224 | 602 | 754 |
+| SQLite 同一行程，WAL，`synchronous=FULL`、`fullfsync=ON` | 248 | 239 | |
+| basalt 經 TCP，`-unsafe-no-fsync` | 4,846 | 13,428 | 16,307 |
+| basalt 同一行程，無網路、不 fsync | 24,046 | 39,447 | |
+| SQLite 同一行程，WAL，`synchronous=NORMAL`（每次提交不 fsync） | 30,926 | 31,281 | |
 
 這些數字老實地說明了：
 
-- **持久化的提交受限於硬碟 flush。** 這台機器上 `F_FULLFSYNC` 約需 4 毫秒，所以單一客戶端在兩個引擎上都大約每秒 250 次提交。客戶端變多時，basalt 的群組提交讓等待中的交易共用一次 flush（8 個客戶端 608、16 個 756），而 SQLite 的單一寫入者只能一個一個來。basalt 剩下的瓶頸是 8 個分行資料列的競爭：每一列都要被持有到該交易的 flush 完成。
-- **不 flush 時，SQLite 每筆交易快得多。** 同一行程、單一客戶端時，SQLite 每秒約 30,000 筆交易，basalt 約 2,600，少了約 12 倍：basalt 每次更新都要寫新版本的資料列和索引項目、記錄頁面差異，並用通用的迭代器執行計畫。經 TCP 時 basalt 每筆交易還要付出七次網路往返（單一客戶端 1,900）。basalt 能隨客戶端數擴展（同一行程 8 個客戶端 33,288），SQLite 不能，但這不是對等的比較：SQLite 本來就不嘗試讓寫入者並行。
-- 同一行程中，一個客戶端每筆交易要 0.35 毫秒，八個客戶端時每個只要 0.20 毫秒；我沒有查清楚為什麼單一客戶端每筆交易做得比較少（M5 大小核的 CPU 排程是可能的原因，但我沒有驗證）。
+- **持久化的提交受限於硬碟 flush。** 這台機器上 `F_FULLFSYNC` 約需 4 毫秒，所以單一客戶端在兩個引擎上都大約每秒 250 次提交。客戶端變多時，basalt 的群組提交讓等待中的交易共用一次 flush（8 個客戶端 602、16 個 754），而 SQLite 的單一寫入者只能一個一個來。basalt 剩下的瓶頸是 8 個分行資料列的競爭：每一列都要被持有到該交易的 flush 完成。
+- **不 flush 時，SQLite 每筆交易還是比較快。** 同一行程、單一客戶端時，SQLite 每秒約 30,900 筆交易，basalt 約 24,000：basalt 每次更新都要寫新版本的資料列和新的索引項目、每筆交易記錄約 4 KB 的頁面差異，並用通用的迭代器執行計畫。經 TCP 時 basalt 每筆交易還要付出七次網路往返（單一客戶端 4,846）。basalt 能隨客戶端數擴展（同一行程 8 個客戶端 39,447），SQLite 不能，但這不是對等的比較：SQLite 本來就不嘗試讓寫入者並行。
+- **單一客戶端的數字是成本模型決定的。** 用 PostgreSQL 的 `random_page_cost` 預設值 4 時，basalt 把只有 8 列的分行表的更新規劃成循序掃描，而循序掃描要讀過上次 VACUUM 以來留下的每一個失效版本（basalt 在兩次 VACUUM 之間不會清理頁面）。這時同一行程的單一客戶端每秒只有約 3,000 筆交易；`go run ./bench/tpcb -embedded -scale 8 -clients 1,8 -duration 10s -set random_page_cost=4` 可以重現，並會印出計畫。用 basalt 的預設值 1.1 時，這個更新會走主鍵索引。為什麼 8 個客戶端沒有受到同樣的影響（兩種設定都約 41,600），我沒有查清楚。
 
 ### 分析型查詢
 
-`bench/analytics/run.py` 用固定種子產生一個小型、類似 TPC-H 的資料集（15,000 位顧客、150,000 筆訂單、599,648 筆明細），把相同的資料載入三個引擎（只有主鍵、都執行過 ANALYZE），確認三者回傳相同結果，並計時七個查詢。basalt 透過網路協定以 psycopg 量測，SQLite 在同一行程內，DuckDB 使用其命令列的計時器。
+`bench/analytics/run.py` 用固定種子產生一個小型、類似 TPC-H 的資料集（15,000 位顧客、150,000 筆訂單、599,648 筆明細），把相同的資料載入三個引擎（只有主鍵、都執行過 ANALYZE），確認三者回傳相同結果，並計時九個查詢。basalt 透過網路協定以 psycopg 量測，SQLite 在同一行程內，DuckDB 使用其命令列的計時器。
 
 ```sh
 python3 bench/analytics/run.py --basalt bin/basalt --scale 1 --repeat 5 --plans
@@ -173,15 +173,19 @@ python3 bench/analytics/run.py --basalt bin/basalt --scale 1 --repeat 5 --plans
 
 | 查詢 | basalt 毫秒 | SQLite 毫秒 | DuckDB 毫秒 | basalt / SQLite |
 |---|---:|---:|---:|---:|
-| Q1 掃描明細 + GROUP BY | 362.8 | 138.9 | 3.0 | 2.6 倍 |
-| Q2 連接 + GROUP BY | 44.9 | 15.6 | 1.0 | 2.9 倍 |
-| Q3 三表連接 + 前 10 名 | 239.0 | 23.7 | 2.0 | 10.1 倍 |
-| Q4 相關 EXISTS | 67.2 | 13.4 | 2.0 | 5.0 倍 |
-| Q5 IN（子查詢） | 33.9 | 13.0 | 1.0 | 2.6 倍 |
-| Q6 count(DISTINCT) | 200.1 | 72.3 | 2.0 | 2.8 倍 |
+| Q1 掃描明細 + GROUP BY | 178.7 | 138.1 | 3.0 | 1.3 倍 |
+| Q2 連接 + GROUP BY | 25.9 | 15.8 | 1.0 | 1.6 倍 |
+| Q3 三表連接 + 前 10 名 | 77.7 | 24.2 | 2.0 | 3.2 倍 |
+| Q4 相關 EXISTS | 42.9 | 13.2 | 2.0 | 3.2 倍 |
+| Q5 IN（子查詢） | 15.0 | 12.9 | 1.0 | 1.2 倍 |
+| Q6 count(DISTINCT) | 72.7 | 71.0 | 2.0 | 1.0 倍 |
 | Q7 主鍵查詢 | 0.1 | 0.0 | 0.0 | |
+| Q8 對沒有索引的欄位做 EXISTS | 27.4 | 141.3 | 1.0 | 0.2 倍 |
+| Q9 把 Q8 寫成會保留為子計畫的形式 | 787.7 | 141.6 | 1.0 | 5.6 倍 |
 
-在這些查詢上 basalt 比 SQLite 慢 2.6 到 10 倍，比向量化欄式引擎 DuckDB 慢兩個數量級。載入資料 basalt 花了 3.6 秒（經網路 COPY），SQLite 0.8 秒，DuckDB 0.4 秒。主要原因是已知的：一次一列地經過迭代器和閉包、`numeric` 用任意精度運算（Q1 和 Q3 要對幾十萬列計算 `price * (1 - discount)`，SQLite 用的是浮點數），以及子查詢沒有被轉成連接（Q4 對每一筆符合條件的訂單做一次索引查詢）。
+在 Q1 到 Q6 上，basalt 從和 SQLite 一樣快（Q6）到慢 3.2 倍（Q3、Q4），比向量化欄式引擎 DuckDB 慢一到兩個數量級。載入資料 basalt 花了 3.1 秒（經網路 COPY），SQLite 0.7 秒，DuckDB 0.4 秒。basalt 一次一列地經過迭代器和閉包，並從分槽頁面解碼資料列版本；Q3 大部分時間花在對明細表做 14,774 次索引查詢。加上 `--plans` 可以看到每個查詢的計畫。
+
+先前的版本比較慢，其中兩個改變值得記下來。Q1 從 363 毫秒降到 181 毫秒（Q3 從 239 降到 100、Q6 從 200 降到 74），靠的是 `numeric` 的 int64 快速路徑，以及只解碼查詢會讀到的欄位。把 Q4 的 EXISTS 去相關化成 semi join，一開始反而讓 Q4 慢了一倍（87 毫秒，原本 42）：規劃器把整張明細表做成雜湊表，因為它把 `o_date >= a` 和 `o_date < b` 當成互相獨立而直接相乘（估計 32,000 筆訂單，實際 5,700），而且把每一次重複的索引查詢都當成要從硬碟讀頁面來計價。改成合併同一欄的上下界、並用 Mackert–Lohman 的頁面估計替重複查詢計價（PostgreSQL 也這樣做）之後，它選了走主鍵的巢狀迴圈 semi join，Q4 回到 42 毫秒，和被取代的逐列子計畫一樣快：在相關欄位有索引時，兩者做的事情相同。去相關化的好處出現在沒有這種索引的時候，例如 Q8：雜湊 semi join 只讀一次訂單表，而 Q9 的子計畫對每位顧客都掃一次訂單表（找到第一筆符合的就停）。SQLite 的 `EXPLAIN QUERY PLAN` 顯示它把 Q8 和 Q9 都當成相關子查詢、對訂單表做掃描來執行；它每位顧客的掃描比 basalt 快 5.6 倍。
 
 ## 限制
 
@@ -189,8 +193,8 @@ python3 bench/analytics/run.py --basalt bin/basalt --scale 1 --repeat 5 --plans
 - 沒有 SERIALIZABLE 隔離（SSI）；REPEATABLE READ 允許寫入偏斜，與 PostgreSQL 相同。沒有 savepoint、`SELECT ... FOR UPDATE`、`LOCK`、`LISTEN/NOTIFY`（接受但忽略）或 prepared transaction。
 - 未實作：view、trigger、預存程序、視窗函式、遞迴 CTE、LATERAL、`DROP COLUMN`、部分索引或運算式索引、遞減索引順序與反向索引掃描、多維陣列、二進位 COPY、UTC 以外的時區、C 以外的定序。
 - 一列資料必須放得進一頁（約 8 KB）；沒有 TOAST。
-- 子查詢不會被轉成連接：相關的 EXISTS 會對每一列外層資料執行一次子計畫（有索引時走索引）。
-- `numeric` 使用任意精度運算（`math/big`），結果精確但速度慢。
+- 只有在 WHERE 裡當作 AND 條件之一的相關 `EXISTS`、`NOT EXISTS` 和 `IN` 會被轉成連接。相關的純量子查詢、`NOT IN`，以及放在 OR 底下的子查詢，仍然對每一列外層資料執行一次（有索引時走索引）。
+- `numeric` 的結果是精確的。位數放得進 64 位元的值走快速路徑；更大的值用 `math/big`，慢很多。
 - 尖銳檢查點在寫回髒頁時會暫停寫入。同一個索引的 B+ 樹寫入者會排隊。DDL 由持有到提交為止的目錄鎖序列化。
 - DROP 或 TRUNCATE 釋放空間時若當機可能遺失（洩漏）分頁，但不會損毀資料。沒有 `VACUUM FULL`（會當作一般 VACUUM 執行）。
 - 查詢結果會先全部算完再送給客戶端。

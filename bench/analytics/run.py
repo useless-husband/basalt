@@ -48,6 +48,15 @@ QUERIES = [
      """SELECT count(*) FROM orders WHERE o_cust IN (SELECT c_id FROM customers WHERE c_nation = 3)"""),
     ("Q6 count(DISTINCT)", "SELECT count(DISTINCT l_part) FROM lineitem"),
     ("Q7 primary key lookup", "SELECT o_total, o_date FROM orders WHERE o_id = 77777"),
+    # The same EXISTS on a column without an index, first as written (basalt
+    # turns it into a semi join), then hidden under OR so that it stays a
+    # subquery executed once per customer.
+    ("Q8 EXISTS, no index",
+     """SELECT count(*) FROM customers WHERE c_id <= 300
+          AND EXISTS (SELECT 1 FROM orders WHERE o_cust = c_id AND o_total > 40000)"""),
+    ("Q9 Q8 as a subplan",
+     """SELECT count(*) FROM customers WHERE c_id <= 300
+          AND (c_id < 0 OR EXISTS (SELECT 1 FROM orders WHERE o_cust = c_id AND o_total > 40000))"""),
 ]
 
 

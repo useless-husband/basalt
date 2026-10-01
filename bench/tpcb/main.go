@@ -47,9 +47,14 @@ func main() {
 	embedded := flag.Bool("embedded", false, "run basalt in-process (no network, no fsync) to measure engine CPU cost")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile (embedded mode)")
 	memprofile := flag.String("memprofile", "", "write an allocation profile (embedded mode)")
+	set := flag.String("set", "", "comma-separated name=value settings for every session (embedded mode), e.g. random_page_cost=4")
 	flag.Parse()
 	if *embedded {
-		runEmbedded(*scale, *clientList, *duration, *cpuprofile, *memprofile)
+		var settings []string
+		if *set != "" {
+			settings = strings.Split(*set, ",")
+		}
+		runEmbedded(*scale, *clientList, *duration, *cpuprofile, *memprofile, settings)
 		return
 	}
 

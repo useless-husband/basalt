@@ -21,7 +21,7 @@ import (
 // runEmbedded runs the TPC-B transaction through the engine API directly
 // (prepared statements, no wire protocol, no fsync), which isolates the
 // engine's CPU cost per transaction.
-func runEmbedded(scale int, clientList string, d time.Duration, cpuprofile, memprofile string) {
+func runEmbedded(scale int, clientList string, d time.Duration, cpuprofile, memprofile string, settings []string) {
 	dir, err := os.MkdirTemp("", "basalt-tpcb-emb-")
 	if err != nil {
 		fail(err)
@@ -47,6 +47,20 @@ func runEmbedded(scale int, clientList string, d time.Duration, cpuprofile, memp
 			fail(err)
 		}
 	}
+	for _, kv := range settings {
+		if _, err := s.Exec("SET " + strings.Replace(kv, "=", " = ", 1)); err != nil {
+			fail(err)
+		}
+	}
+	res, err := s.Exec(`EXPLAIN UPDATE pgbench_branches SET bbalance = bbalance + 1 WHERE bid = 1`)
+	if err != nil {
+		fail(err)
+	}
+	var plan []string
+	for _, r := range res[0].Rows {
+		plan = append(plan, strings.TrimSpace(r[0].S))
+	}
+	fmt.Printf("# settings %v; branch update plan: %s\n", settings, strings.Join(plan, " / "))
 	s.Close()
 	if cpuprofile != "" {
 		f, err := os.Create(cpuprofile)
@@ -80,6 +94,11 @@ func runEmbedded(scale int, clientList string, d time.Duration, cpuprofile, memp
 				defer wg.Done()
 				s := db.NewSession("bench", "bench")
 				defer s.Close()
+				for _, kv := range settings {
+					if _, err := s.Exec("SET " + strings.Replace(kv, "=", " = ", 1)); err != nil {
+						fail(err)
+					}
+				}
 				prep := func(q string) *engine.Prepared {
 					p, err := s.Prepare("", q, nil)
 					if err != nil {

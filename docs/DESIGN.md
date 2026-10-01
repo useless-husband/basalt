@@ -88,6 +88,13 @@ continue) was rejected for now: it adds a dirty-page table and a more
 subtle recovery start point, and the sharp version made correctness easy
 to argue while everything else was being built.
 
+A checkpoint runs every `-checkpoint-interval` (default 30 s) or after
+512 MiB of WAL. Frequent checkpoints cost throughput beyond the pause:
+the next change to every page after a checkpoint logs a full 8 KiB image.
+The size threshold was raised from 64 MiB to 512 MiB after TPC-B runs
+showed the in-process load (about 150 MiB of WAL per second at 8
+clients) checkpointing several times a second.
+
 ### Recovery: redo only
 
 Recovery reads the control file, replays every log record from the redo
@@ -273,6 +280,13 @@ aggregate is a grouping error.
 * Constant folding, including three-valued simplification of AND/OR and
   CASE arms with constant conditions; an expression that errors (`1/0`)
   is left unfolded so the error only happens if it is evaluated.
+* Subquery decorrelation: a WHERE conjunct `EXISTS (...)`, `NOT EXISTS
+  (...)` or `x IN (...)` whose subquery is correlated only through its
+  top-level WHERE becomes a semi or anti join whose condition is the
+  correlated conjuncts (plus `x = column` for IN). Forms whose semantics
+  differ from a join are left as per-row subplans: `NOT IN` (a NULL in
+  the subquery makes it unknown rather than true), subqueries under OR or
+  NOT, and subqueries with LIMIT, aggregates or set operations.
 * Predicate pushdown through projections (by substitution), into join
   inputs and join conditions, below GROUP BY for predicates on grouping
   columns, and into scans. A WHERE predicate that rejects NULLs from the
@@ -281,11 +295,22 @@ aggregate is a grouping error.
 ### Physical planning and the cost model
 
 Costs use PostgreSQL's units and default constants (sequential page = 1,
-random page = 4, CPU per tuple 0.01, per operator 0.0025). Estimates come
-from ANALYZE statistics: row counts scaled to the current table size,
-null fraction, distinct counts (Haas–Stokes estimator over a 30,000-row
-reservoir sample), most common values with frequencies, and 20-bucket
-equi-depth histograms with linear interpolation.
+CPU per tuple 0.01, per operator 0.0025), except that `random_page_cost`
+defaults to 1.1, the value usually recommended for SSDs, instead of 4.0:
+basalt reads pages from its buffer pool or an SSD, and with 4.0 it chose
+hash joins over index probes that were measured to be twice as fast.
+Repeated index probes on the inner side of a nested loop are charged the
+Mackert–Lohman estimate of distinct pages read over all probes, given
+`effective_cache_size` (by default the buffer pool size), as PostgreSQL's
+`cost_index` does. Both are settings.
+
+Estimates come from ANALYZE statistics: row counts scaled to the current
+table size, null fraction, distinct counts (Haas–Stokes estimator over a
+30,000-row reservoir sample), most common values with frequencies, and
+20-bucket equi-depth histograms with linear interpolation (numbers,
+dates and timestamps). A lower and an upper bound on the same column are
+combined into the fraction between them instead of being multiplied as
+if independent; other conjuncts are assumed independent.
 
 * Access paths: sequential scan, or an index scan using equality on a
   prefix of the index columns plus a range on the next one; values may be
@@ -308,11 +333,16 @@ every iterator to count rows, loops and time.
 ### Executor
 
 Pull-based iterators. Expressions are compiled once per execution into Go
-closures over the operator's input layout. Correlated subqueries are
-re-executed with their outer columns bound; uncorrelated ones are
-evaluated once per statement, and `x IN (subquery)` builds a hash set.
-Subqueries are not decorrelated into joins, which is the biggest planner
-gap for analytical queries.
+closures over the operator's input layout. Correlated subqueries that were
+not turned into joins are re-executed with their outer columns bound;
+uncorrelated ones are evaluated once per statement, and `x IN (subquery)`
+builds a hash set. Table scans decode only the columns some operator
+reads.
+
+`numeric` values are exact decimals. Values whose coefficient fits in an
+int64 take a fast path for addition, subtraction, multiplication,
+comparison and rounding (checked for overflow, falling back to `math/big`),
+and are stored in rows as a scale plus a varint; others use `math/big`.
 
 ## Wire protocol and catalog emulation
 
@@ -355,4 +385,4 @@ and executor as any other query.
 | RC conflicts | restart the statement | EvalPlanQual | no version chains needed |
 | Column references | query-wide ids | positions | free reordering of joins and pushdown |
 | Catalog storage | JSON blob in pages | system tables | small catalogs, atomic replacement in one record |
-| Numeric | arbitrary precision (math/big) | fixed point | exact PostgreSQL semantics, at a CPU cost |
+| Numeric | exact decimal, int64 fast path, math/big beyond | float64 | exact PostgreSQL semantics; the fast path covers typical money and quantity values |
