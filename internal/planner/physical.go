@@ -512,6 +512,9 @@ func nodeDetails(p Plan, opt ExplainOptions) []string {
 		done := map[string]bool{}
 		for _, c := range expr.Conjuncts(x.IndexCond) {
 			done[c.String()] = true
+			if call, ok := c.(*expr.Call); ok && call.Fn.Op == "=" && len(call.Args) == 2 {
+				done["("+call.Args[1].String()+" = "+call.Args[0].String()+")"] = true
+			}
 		}
 		var rest []expr.Expr
 		for _, c := range expr.Conjuncts(x.Filter) {

@@ -10,7 +10,7 @@ It exists to show, at a size one person can read (about 29,000 lines of Go), how
 
 ## A session with psql
 
-The real output of `psql -a -f demo.sql` against basalt (nothing edited):
+The real output of `psql -a -f demo.sql` against basalt, with the script from [`docs/demo.sql`](docs/demo.sql) (nothing edited except trailing spaces):
 
 ```text
 CREATE TABLE accounts (id serial PRIMARY KEY, owner text NOT NULL, balance numeric(12,2) NOT NULL CHECK (balance >= 0));
@@ -54,20 +54,24 @@ psql:demo.sql:10: ERROR:  new row for relation "accounts" violates check constra
 ANALYZE;
 ANALYZE
 EXPLAIN ANALYZE SELECT a.owner, sum(t.amount) FROM accounts a JOIN transfers t ON t.src = a.id WHERE a.id < 100 GROUP BY a.owner;
-                                                           QUERY PLAN
---------------------------------------------------------------------------------------------------------------------------------
- HashAggregate  (cost=5.04..5.05 rows=1 width=15) (actual time=0.016 rows=1 loops=1)
+                                                              QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=5.04..5.05 rows=1 width=15) (actual time=0.015..0.015 rows=1 loops=1)
    Group Key: a.owner
-   ->  Nested Loop  (cost=2.00..5.04 rows=1 width=63) (actual time=0.014 rows=1 loops=1)
-         ->  Seq Scan on transfers t  (cost=0.00..1.01 rows=1 width=40) (actual time=0.003 rows=1 loops=1)
-         ->  Index Scan using accounts_pkey on accounts a  (cost=2.00..4.02 rows=1 width=23) (actual time=0.009 rows=1 loops=1)
+   ->  Nested Loop  (cost=2.00..5.04 rows=1 width=63) (actual time=0.013..0.013 rows=1 loops=1)
+         ->  Seq Scan on transfers t  (cost=0.00..1.01 rows=1 width=40) (actual time=0.002..0.002 rows=1 loops=1)
+         ->  Index Scan using accounts_pkey on accounts a  (cost=2.00..4.02 rows=1 width=23) (actual time=0.007..0.007 rows=1 loops=1)
                Index Cond: (a.id = t.src)
-               Filter: ((a.id < 100) AND (t.src = a.id))
+               Filter: (a.id < 100)
  Execution Time: 0.022 ms
 (8 rows)
-```
 
-(The transcript predates two cosmetic changes: EXPLAIN ANALYZE now prints `actual time=first..last` like PostgreSQL and no longer repeats the index condition in `Filter`.)
+SELECT count(*), sum(balance) FROM accounts;
+ count |    sum
+-------+------------
+ 10000 | 1000000.00
+(1 row)
+```
 
 ## What it implements
 
@@ -130,7 +134,54 @@ The sqllogictest failures are of two kinds: places where PostgreSQL's semantics 
 
 ## Benchmarks
 
-BENCHMARKS_PLACEHOLDER
+All numbers were measured on one machine: Apple M5 (10 cores), 16 GB RAM, internal SSD (APFS), macOS 27.0, Go 1.27.1, SQLite 3.45.3 (Python's `sqlite3` module), DuckDB 1.5.5. The machine was shared with other build jobs while measuring, so repeated runs vary by roughly 10 to 20 percent; each TPC-B figure is one 20-second run and each query time is the median of five runs. The raw output of every run is reproduced by the commands shown.
+
+### TPC-B (pgbench's transaction)
+
+`bench/tpcb` implements pgbench's built-in transaction: inside BEGIN/COMMIT, update an account, read it back, update a teller and a branch, insert a history row. Scale 8 (800,000 accounts, 8 branches), one connection per client, statements prepared (pgx's statement cache). `bench/tpcb/sqlite_tpcb.py` runs the same transaction against SQLite with `BEGIN IMMEDIATE`. The embedded mode calls basalt's engine directly and checks TPC-B consistency (account, teller, branch and history totals agree) after every run.
+
+```sh
+go run ./bench/tpcb -basalt bin/basalt -scale 8 -clients 1,8,16 -duration 20s               # durable
+go run ./bench/tpcb -basalt bin/basalt -scale 8 -clients 1,8,16 -duration 20s -no-fsync     # no fsync
+go run ./bench/tpcb -embedded -scale 8 -clients 1,8 -duration 20s                            # in-process
+python3 bench/tpcb/sqlite_tpcb.py --scale 8 --clients 1,8 --duration 20
+```
+
+Transactions per second:
+
+| Configuration | 1 client | 8 clients | 16 clients |
+|---|---:|---:|---:|
+| basalt over TCP, durable (F_FULLFSYNC, group commit) | 218 | 608 | 756 |
+| SQLite in-process, WAL, `synchronous=FULL`, `fullfsync=ON` | 247 | 238 | |
+| basalt over TCP, `-unsafe-no-fsync` | 1,900 | 12,132 | 15,957 |
+| basalt in-process, no network, no fsync | 2,617 | 33,288 | |
+| SQLite in-process, WAL, `synchronous=NORMAL` (no fsync per commit) | 30,567 | 31,144 | |
+
+What this shows, plainly:
+
+- **Durable commits are limited by the drive flush.** `F_FULLFSYNC` takes about 4 ms here, so one client gets roughly 250 commits per second on either engine. With more clients basalt's group commit shares each flush among the transactions waiting for it (608 at 8 clients, 756 at 16), while SQLite's single writer serializes them. The remaining limit for basalt is contention on the 8 branch rows, each held until its transaction's flush completes.
+- **Without the flush, SQLite is much faster per transaction.** In-process with one client, SQLite runs about 30,000 transactions per second and basalt about 2,600, roughly 12 times fewer: basalt writes a new row version and index entries for every update and logs page diffs, and it executes plans through generic iterators. Over TCP basalt also pays seven round trips per transaction (1,900 with one client). basalt scales across clients (33,288 in-process with 8) where SQLite does not, but that comparison is not like for like: SQLite does not try to run writers concurrently.
+- One client in-process takes 0.35 ms per transaction while each of eight takes 0.20 ms; I have not established why a single client gets less work done per transaction (CPU scheduling on the M5's mixed cores is a plausible cause I did not verify).
+
+### Analytical queries
+
+`bench/analytics/run.py` generates a small TPC-H-like data set with a fixed seed (15,000 customers, 150,000 orders, 599,648 line items), loads identical rows into the three engines (primary keys only, ANALYZE run), checks that all three return the same results, and times seven queries. basalt is measured through its wire protocol with psycopg, SQLite in-process, DuckDB with its CLI's timer.
+
+```sh
+python3 bench/analytics/run.py --basalt bin/basalt --scale 1 --repeat 5 --plans
+```
+
+| Query | basalt ms | SQLite ms | DuckDB ms | basalt / SQLite |
+|---|---:|---:|---:|---:|
+| Q1 scan + GROUP BY over line items | 362.8 | 138.9 | 3.0 | 2.6x |
+| Q2 join + GROUP BY | 44.9 | 15.6 | 1.0 | 2.9x |
+| Q3 three-way join + top 10 | 239.0 | 23.7 | 2.0 | 10.1x |
+| Q4 correlated EXISTS | 67.2 | 13.4 | 2.0 | 5.0x |
+| Q5 IN (subquery) | 33.9 | 13.0 | 1.0 | 2.6x |
+| Q6 count(DISTINCT) | 200.1 | 72.3 | 2.0 | 2.8x |
+| Q7 primary key lookup | 0.1 | 0.0 | 0.0 | |
+
+basalt is 2.6 to 10 times slower than SQLite on these queries and two orders of magnitude slower than DuckDB, a vectorized columnar engine. Loading took 3.6 s in basalt (COPY over the wire), 0.8 s in SQLite and 0.4 s in DuckDB. The main reasons are known: one row at a time through iterators and closures, `numeric` arithmetic in arbitrary precision (Q1 and Q3 compute `price * (1 - discount)` for hundreds of thousands of rows; SQLite uses floating point), and no subquery decorrelation (Q4 runs an index lookup per qualifying order).
 
 ## Limitations
 
